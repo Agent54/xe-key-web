@@ -1,7 +1,13 @@
 <!-- SPDX-License-Identifier: BSD-3-Clause -->
 <!-- Copyright (c) 2026 The Key-Origin Web Authors. See LICENSE. -->
 
-# Key-Origin Web (`key-web://`) — Experimental Monorepo
+# Key-Origin Web (`key-web://`) — Experimental Exploration
+
+> [!WARNING]
+> **Experimental / Exploratory R&D Only — Not Production Software.**
+> This repository is an open architectural exploration of DNS-free, CA-free, key-anchored Signed Web Bundles (`key-web://`) and human-readable multi-rail resolution. Expect rough edges, evolving specs, and known design trade-offs (see [docs/RELATED-WORK-AND-DESIGN-NOTES.md](docs/RELATED-WORK-AND-DESIGN-NOTES.md)).
+> - **Runnable prototypes today:** `app/` (browser-hosted KeyWeb Runner + 3 local-first demo apps) and `resolver/` (Node 22+ multi-rail `.at`/`.dht`/`.nostr`/`.local`/`.key` resolver + KERI pre-rotation).
+> - **Uncompiled dry-run only:** `chromium-patches/` (`KW1–KW3`) dry-run cleanly against Chromium `160.0.8176.0` source but have **not** been compiled into a browser binary.
 
 **Unprivileged Signed Web Bundles anchored to cryptographic keys, not servers.** A DNS-free, CA-free, transport-agnostic, local-first, zero-egress web origin model with human-readable multi-rail name resolution and KERI pre-rotation.
 
