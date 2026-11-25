@@ -11,6 +11,7 @@
 | [ARCHITECTURE-SPEC.md](ARCHITECTURE-SPEC.md) | The precise rules: origin and URL scheme, human-readable rail names (§1.7), the zero-egress sandbox and capability ladder, transport-agnostic resolution, key rotation and naming, and a comparison matrix |
 | [CHROMIUM-160-BLUEPRINT.md](CHROMIUM-160-BLUEPRINT.md) | How to build it on Chromium `160.0.8176.0`, with real files and line numbers. Layer A runs today in a SuperFrame IWA; Layer B is the native patch series KW1–KW6. |
 | [THREAT-MODEL.md](THREAT-MODEL.md) | How it can be attacked, what stops each attack, what residual risk remains, and the testable security invariants |
+| [RELATED-WORK-AND-DESIGN-NOTES.md](RELATED-WORK-AND-DESIGN-NOTES.md) | Comparison with Atproto Web Names (`atw://`), Web Tiles (`dasl.ing`), Peergos, and Chromium IWAs — how they combine on one `.swbn` + zero-egress runtime, plus honest lessons from prototyping & red-teaming |
 
 **Links people can read.** You share `key-web://cool-site.lukeinth.at/` (or `.dht`, `.nostr`, `.local`). The browser resolves the name over that rail, then commits to `key-web://<kw-id>.key/`. Origin, storage, CSP, and grants are anchored to the **key only**, so every rail opens the same app and data, and a hijacked name fails closed instead of handing over your data.
 

@@ -9,7 +9,7 @@
 
 | Directory | Status | Description |
 |---|---|---|
-| [`docs/`](docs/README.md) | Architecture & Specs | Plain-English explainer, full architecture specification, Chromium 160 blueprint, and threat model. |
+| [`docs/`](docs/README.md) | Architecture & Specs | Plain-English explainer, full architecture specification, Chromium 160 blueprint, threat model, and [related work & design notes](docs/RELATED-WORK-AND-DESIGN-NOTES.md) (`atw://`, Web Tiles, Peergos, IWA synthesis). |
 | [`app/`](app/README.md) | Runnable (Zero-Dep, Node 22+) | **KeyWeb Runner** IWA & 3 demo apps (`localpad`, `leakytracker`, `peersync-calc`), Ed25519 `.swbn` verifier, zero-egress sandbox, zero-sink/hygiene/icon gates, and 240 tests. |
 | [`resolver/`](resolver/README.md) | Runnable (Zero-Dep, Node 22+) | Multi-rail `key-web://` resolver (`.at`, `.dht`, `.nostr`, `.local`, `.key`) with TOFU pinning, cross-rail equivalence, handle-hijack fail-closed detection, KERI pre-rotation, and 72 tests. |
 | [`chromium-patches/`](chromium-patches/README.md) | **Experimental / Uncompiled Dry-Run** | Chromium `160.0.8176.0` native `key-web://` scheme & verifier patches (`KW1–KW3`). Verified with clean `patch --dry-run -p1` stacking (`0` fuzz, `0` offsets); **not yet compiled** against a full Chromium checkout. |
