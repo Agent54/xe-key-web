@@ -1,0 +1,1193 @@
+Subject: [PATCH KW2/3] key-web: exfiltration-proof CSP, Connection-Allowlist
+ and KeyWebNavigationThrottle
+
+SPDX-License-Identifier: BSD-3-Clause
+Copyright 2026 The Key-Origin Web Authors
+Target: Chromium 160.0.8176.0 (apply after KW1: patch -p1 -d src < this.patch)
+
+Tier 0 egress lockdown for key-web:// documents (Spec §2.2-§2.8).
+
+L1 CSP (components/webapps/key_web/policy/header_policy.*)
+  Enforced on every key-web response, added next to the app's own policy so
+  an app can only tighten it:
+    default-src 'self'; connect-src 'none'; img-src 'self' data: blob:;
+    form-action 'none'
+  plus script/style/media/font/worker/frame/manifest/object/base-uri/
+  frame-ancestors/trusted-types hardening, none of which adds a network
+  source. There is NO `navigate-to`: Chromium 160 does not implement it
+  (absent from network::mojom::CSPDirectiveName), and an ignored directive
+  would give false assurance.
+
+L2 Connection-Allowlist
+  `(response-origin);redirects=block;webrtc=block`. response-origin is the
+  non-network key-web origin, so the network service refuses ResolveHost,
+  PreconnectSockets, Prefetch, WebTransport and WebRTC binders for the
+  document. This is the load-bearing control for <link rel=preconnect>,
+  which bypasses CSP and X-DNS-Prefetch-Control in M160.
+
+L3 Navigation Gate (chrome/browser/key_web/key_web_navigation_throttle.*)
+  KeyWebNavigationThrottle runs on WillStartRequest and WillRedirectRequest
+  for navigations whose initiator is a key-web origin:
+    same origin / about:blank / about:srcdoc / data:  -> PROCEED
+    prerender, speculation rules                      -> CANCEL
+    cross-origin subframe (ambient egress)            -> BLOCK_REQUEST
+    cross-origin top level without user gesture       -> BLOCK_REQUEST
+    cross-origin top level with user gesture          -> CANCEL, then a
+      browser-owned tab-modal prompt shows the FULL URL (Open / Copy /
+      Cancel). Open is a browser-initiated new foreground tab: no opener,
+      no referrer, no key-web initiator.
+  ChromeContentBrowserClient::CanCreateWindow() applies the same gate to
+  window.open() and target=_blank before any other feature handles them.
+
+L5 Header sanitizer
+  App-supplied Report-To, Reporting-Endpoints, NEL, *-Report-Only,
+  Connection-Allowlist*, Allow-Connection-Allowlist-From, Link, Refresh,
+  Speculation-Rules, Set-Cookie, Alt-Svc, ... are stripped, and report-uri /
+  report-to directives are removed from app CSP headers.
+
+DNS prefetch / preconnect hints
+  * X-DNS-Prefetch-Control: off is injected (irreversible per document).
+  * OverrideWebPreferences{,AfterNavigation}() clear
+    WebPreferences::dns_prefetching_enabled while the main frame is key-web.
+  * NetworkHintsHandlerImpl::{PrefetchDNS,Preconnect} drop hints from any
+    frame that is, or is nested in, a key-web document before they reach
+    the PreconnectManager.
+
+KW3 calls key_web::SetRequiredHeadersForKeyWeb() from the loader factory.
+
+Tests: unit_tests --gtest_filter='KeyWebNavigationPolicyTest.*:KeyWebHeaderPolicyTest.*'
+
+diff --git a/chrome/browser/BUILD.gn b/chrome/browser/BUILD.gn
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -1580,6 +1580,7 @@
+       "//chrome/browser/headless:command_processor",
+       "//chrome/browser/headless:headless_extra_parts",
+       "//chrome/browser/indigo/onboarding",
++      "//chrome/browser/key_web",
+       "//chrome/browser/media/router/discovery/access_code:access_code_sink_service",
+       "//chrome/browser/password_manager/remote_actor",
+       "//chrome/browser/printing",
+diff --git a/chrome/browser/chrome_content_browser_client.cc b/chrome/browser/chrome_content_browser_client.cc
+--- a/chrome/browser/chrome_content_browser_client.cc
++++ b/chrome/browser/chrome_content_browser_client.cc
+@@ -578,6 +578,8 @@
+ #include "chrome/browser/glic/public/features.h"
+ #include "chrome/browser/headless/headless_command_processor.h"
+ #include "chrome/browser/indigo/onboarding/indigo_onboarding_dialog.h"
++#include "chrome/browser/key_web/key_web_navigation_policy.h"
++#include "chrome/browser/key_web/key_web_navigation_throttle.h"
+ #include "chrome/browser/loader/features.h"
+ #include "chrome/browser/loader/fetch_keepalive_process_manager.h"
+ #include "chrome/browser/metrics/usage_scenario/chrome_responsiveness_calculator_delegate.h"
+@@ -4518,9 +4520,38 @@
+             pwc::PrivilegedWebContents::FromWebContents(web_contents)) {
+       privileged->HandleWindowCreation(opener, target_url, disposition,
+                                        features);
++    }
++    return false;
++  }
++
++#if !BUILDFLAG(IS_ANDROID)
++  // key-web Navigation Gate for popups (Spec §2.5 NG2/NG4/NG5). A key-web
++  // document may open same-origin windows (with noopener: COOP same-origin
++  // severs them anyway). It may never create a window onto another origin:
++  // with a user gesture the URL goes through the browser-owned full-URL
++  // prompt, which opens it as a fresh browser-initiated tab with no opener
++  // and no referrer; without a gesture it is dropped. Handled here, before
++  // any other feature can take over the window creation.
++  if (key_web::IsKeyWebOrigin(source_origin) ||
++      key_web::IsKeyWebOrigin(opener->GetLastCommittedOrigin())) {
++    const url::Origin target_origin = url::Origin::Create(target_url);
++    if (target_url.is_empty() || target_url.IsAboutBlank() ||
++        target_origin.IsSameOriginWith(source_origin)) {
++      *no_javascript_access = !target_url.is_empty() &&
++                              !target_url.IsAboutBlank();
++      return true;
++    }
++    if (user_gesture) {
++      key_web::OfferOutboundNavigation(web_contents, target_url);
++    } else {
++      opener->AddMessageToConsole(
++          blink::mojom::ConsoleMessageLevel::kError,
++          "key-web: blocked a popup to another origin that was not triggered "
++          "by a user gesture.");
+     }
+     return false;
+   }
++#endif  // !BUILDFLAG(IS_ANDROID)
+ 
+   // This block gives the Contextual Tasks feature the opportunity to intercept
+   // tab creation in the event it doesn't go directly through the feature's
+@@ -5093,6 +5124,19 @@
+ 
+   web_prefs->is_xslt_deprecation_banner_suppressed =
+       prefs->GetBoolean(prefs::kXSLTDeprecationBannerSuppressed);
++
++#if !BUILDFLAG(IS_ANDROID)
++  // key-web (Spec §2.8, C5): belt and braces next to the injected
++  // X-DNS-Prefetch-Control: off and the network-service Connection-Allowlist.
++  // Disables Blink's <link rel=dns-prefetch> path (Settings::
++  // GetDNSPrefetchingEnabled) for pages whose main frame is key-web.
++  if (main_frame_site.GetSecurityPrincipal().SchemeIs(
++          key_web::kKeyWebScheme) ||
++      key_web::IsKeyWebOrigin(
++          web_contents->GetPrimaryMainFrame()->GetLastCommittedOrigin())) {
++    web_prefs->dns_prefetching_enabled = false;
++  }
++#endif  // !BUILDFLAG(IS_ANDROID)
+ }
+ 
+ bool ChromeContentBrowserClientParts::OverrideWebPreferencesAfterNavigation(
+@@ -5117,6 +5161,16 @@
+       web_contents->GetPrimaryMainFrame()->GetLastCommittedOrigin());
+   prefs_changed |= web_prefs->clipboard_focus_exempt != clipboard_focus_exempt;
+   web_prefs->clipboard_focus_exempt = clipboard_focus_exempt;
++
++#if !BUILDFLAG(IS_ANDROID)
++  // key-web: keep DNS prefetching off for as long as the main frame is a
++  // key-web document (the same WebContents may navigate in and out).
++  const bool dns_prefetching_enabled = !key_web::IsKeyWebOrigin(
++      web_contents->GetPrimaryMainFrame()->GetLastCommittedOrigin());
++  prefs_changed |=
++      web_prefs->dns_prefetching_enabled != dns_prefetching_enabled;
++  web_prefs->dns_prefetching_enabled = dns_prefetching_enabled;
++#endif  // !BUILDFLAG(IS_ANDROID)
+ 
+ #if !BUILDFLAG(IS_ANDROID)
+   const bool require_transient_activation_for_get_display_media =
+diff --git a/chrome/browser/chrome_content_browser_client_navigation_throttles.cc b/chrome/browser/chrome_content_browser_client_navigation_throttles.cc
+--- a/chrome/browser/chrome_content_browser_client_navigation_throttles.cc
++++ b/chrome/browser/chrome_content_browser_client_navigation_throttles.cc
+@@ -101,6 +101,7 @@
+ #else  // BUILDFLAG(IS_ANDROID)
+ #include "chrome/browser/background/background_contents_navigation_throttle.h"
+ #include "chrome/browser/devtools/devtools_navigation_throttle.h"
++#include "chrome/browser/key_web/key_web_navigation_throttle.h"
+ #include "chrome/browser/page_info/web_view_side_panel_throttle.h"
+ #include "chrome/browser/themes/theme_service_factory.h"
+ #include "chrome/browser/ui/lens/lens_overlay_side_panel_navigation_throttle.h"
+@@ -630,6 +631,9 @@
+ #if !BUILDFLAG(IS_ANDROID)
+   BackgroundContentsNavigationThrottle::MaybeCreateAndAdd(registry);
+   web_app::IsolatedWebAppThrottle::MaybeCreateAndAdd(registry);
++  // Navigation Gate for unprivileged key-web:// documents. M160 has no CSP
++  // navigate-to, so outbound navigation is policed here.
++  key_web::KeyWebNavigationThrottle::MaybeCreateAndAdd(registry);
+   DevToolsNavigationThrottle::MaybeCreateAndAdd(registry);
+ #endif  // !BUILDFLAG(IS_ANDROID)
+ 
+diff --git a/chrome/browser/key_web/BUILD.gn b/chrome/browser/key_web/BUILD.gn
+new file mode 100644
+--- /dev/null
++++ b/chrome/browser/key_web/BUILD.gn
+@@ -0,0 +1,36 @@
++# Copyright 2026 The Key-Origin Web Authors
++# SPDX-License-Identifier: BSD-3-Clause
++
++assert(is_chromeos || is_win || is_mac || is_linux)
++
++# Navigation Gate (Spec §2.5) for key-web:// documents.
++source_set("key_web") {
++  sources = [
++    "key_web_navigation_policy.cc",
++    "key_web_navigation_policy.h",
++    "key_web_navigation_throttle.cc",
++    "key_web_navigation_throttle.h",
++  ]
++  deps = [
++    "//base",
++    "//chrome/browser/ui:tab_modal_confirm_dialog",
++    "//chrome/common:chrome_features",
++    "//components/webapps/key_web:scheme",
++    "//content/public/browser",
++    "//third_party/blink/public/common:headers",
++    "//ui/base",
++    "//ui/base/clipboard",
++    "//url",
++  ]
++}
++
++source_set("unit_tests") {
++  testonly = true
++  sources = [ "key_web_navigation_policy_unittest.cc" ]
++  deps = [
++    ":key_web",
++    "//components/webapps/key_web/policy:unit_tests",
++    "//testing/gtest",
++    "//url",
++  ]
++}
+diff --git a/chrome/browser/key_web/key_web_navigation_policy.cc b/chrome/browser/key_web/key_web_navigation_policy.cc
+new file mode 100644
+--- /dev/null
++++ b/chrome/browser/key_web/key_web_navigation_policy.cc
+@@ -0,0 +1,46 @@
++// Copyright 2026 The Key-Origin Web Authors
++// SPDX-License-Identifier: BSD-3-Clause
++
++#include "chrome/browser/key_web/key_web_navigation_policy.h"
++
++#include "components/webapps/key_web/scheme.h"
++#include "url/url_constants.h"
++
++namespace key_web {
++
++bool IsKeyWebOrigin(const url::Origin& origin) {
++  return !origin.opaque() && origin.scheme() == kKeyWebScheme;
++}
++
++NavigationVerdict DecideKeyWebNavigation(const NavigationFacts& facts) {
++  if (!facts.initiator_origin || !IsKeyWebOrigin(*facts.initiator_origin)) {
++    return NavigationVerdict::kNotKeyWeb;
++  }
++
++  // NG1. url::Origin::Create() resolves blob:key-web://<id>.key/<uuid> to the
++  // key-web origin, so same-origin blob: navigations land here too.
++  if (url::Origin::Create(facts.url).IsSameOriginWith(*facts.initiator_origin)) {
++    return NavigationVerdict::kAllowSameOrigin;
++  }
++
++  // Local documents that cannot carry data to the network.
++  if (facts.url.IsAboutBlank() || facts.url.IsAboutSrcdoc() ||
++      facts.url.SchemeIs(url::kDataScheme)) {
++    return NavigationVerdict::kAllowInert;
++  }
++
++  // Everything else is outbound (NG2): https:, other key-web keys, external
++  // protocols (mailto:, tel:, custom), filesystem:, cross-origin blob:, ...
++  if (facts.is_speculative) {
++    return NavigationVerdict::kCancelSpeculative;  // NG7
++  }
++  if (!facts.is_main_frame) {
++    return NavigationVerdict::kBlockSubframe;
++  }
++  if (!facts.has_user_gesture) {
++    return NavigationVerdict::kBlockNoUserGesture;  // NG4
++  }
++  return NavigationVerdict::kConfirmInNewContext;  // NG4 + NG5
++}
++
++}  // namespace key_web
+diff --git a/chrome/browser/key_web/key_web_navigation_policy.h b/chrome/browser/key_web/key_web_navigation_policy.h
+new file mode 100644
+--- /dev/null
++++ b/chrome/browser/key_web/key_web_navigation_policy.h
+@@ -0,0 +1,54 @@
++// Copyright 2026 The Key-Origin Web Authors
++// SPDX-License-Identifier: BSD-3-Clause
++
++#ifndef CHROME_BROWSER_KEY_WEB_KEY_WEB_NAVIGATION_POLICY_H_
++#define CHROME_BROWSER_KEY_WEB_KEY_WEB_NAVIGATION_POLICY_H_
++
++#include <optional>
++
++#include "url/gurl.h"
++#include "url/origin.h"
++
++namespace key_web {
++
++// The Navigation Gate (Spec §2.5, L3). Chromium 160 has no CSP `navigate-to`,
++// so outbound navigation from key-web documents is decided here, in the
++// browser process, from facts the renderer cannot forge.
++enum class NavigationVerdict {
++  // Not initiated by a key-web document: not our business.
++  kNotKeyWeb,
++  // NG1: same key-web origin (including blob: URLs whose inner origin matches).
++  kAllowSameOrigin,
++  // Local, network-free targets (about:blank, about:srcdoc, data:).
++  kAllowInert,
++  // NG7: prerender / speculative loads of outbound URLs never happen.
++  kCancelSpeculative,
++  // Ambient subframe egress (<iframe src=https://evil/?d=...>): always
++  // blocked. A subframe load can never be user-mediated.
++  kBlockSubframe,
++  // NG4: outbound top-level navigation without a user gesture (location=,
++  // meta refresh, timers, window.open without activation): blocked silently.
++  kBlockNoUserGesture,
++  // NG4/NG5: outbound top-level navigation WITH a user gesture: cancelled in
++  // place, then re-offered through a browser-owned prompt that shows the full
++  // URL and opens it in a new top-level context with no opener and no
++  // referrer, attributed to an opaque initiator.
++  kConfirmInNewContext,
++};
++
++struct NavigationFacts {
++  std::optional<url::Origin> initiator_origin;
++  GURL url;
++  bool is_main_frame = false;
++  bool has_user_gesture = false;
++  bool is_speculative = false;
++};
++
++NavigationVerdict DecideKeyWebNavigation(const NavigationFacts& facts);
++
++// True iff `origin` is a key-web:// origin.
++bool IsKeyWebOrigin(const url::Origin& origin);
++
++}  // namespace key_web
++
++#endif  // CHROME_BROWSER_KEY_WEB_KEY_WEB_NAVIGATION_POLICY_H_
+diff --git a/chrome/browser/key_web/key_web_navigation_policy_unittest.cc b/chrome/browser/key_web/key_web_navigation_policy_unittest.cc
+new file mode 100644
+--- /dev/null
++++ b/chrome/browser/key_web/key_web_navigation_policy_unittest.cc
+@@ -0,0 +1,91 @@
++// Copyright 2026 The Key-Origin Web Authors
++// SPDX-License-Identifier: BSD-3-Clause
++
++#include "chrome/browser/key_web/key_web_navigation_policy.h"
++
++#include "testing/gtest/include/gtest/gtest.h"
++#include "url/gurl.h"
++#include "url/origin.h"
++
++namespace key_web {
++namespace {
++
++constexpr char kAppA[] =
++    "key-web://mix2p32okr3zpmwz3pily6bmbjlfrjvpyzljdkc4mzvpkb6lf2mqaaic.key";
++
++NavigationFacts Facts(std::string_view url,
++                      bool main_frame = true,
++                      bool gesture = false,
++                      std::optional<std::string_view> initiator = kAppA) {
++  NavigationFacts facts;
++  if (initiator) {
++    facts.initiator_origin = url::Origin::Create(GURL(*initiator));
++  }
++  facts.url = GURL(url);
++  facts.is_main_frame = main_frame;
++  facts.has_user_gesture = gesture;
++  return facts;
++}
++
++TEST(KeyWebNavigationPolicyTest, NonKeyWebInitiatorIsIgnored) {
++  EXPECT_EQ(DecideKeyWebNavigation(
++                Facts("https://a.test/", true, false, "https://b.test")),
++            NavigationVerdict::kNotKeyWeb);
++  EXPECT_EQ(DecideKeyWebNavigation(
++                Facts("https://a.test/", true, false, std::nullopt)),
++            NavigationVerdict::kNotKeyWeb);
++}
++
++TEST(KeyWebNavigationPolicyTest, SameOriginFree) {
++  EXPECT_EQ(DecideKeyWebNavigation(Facts(std::string(kAppA) + "/next.html")),
++            NavigationVerdict::kAllowSameOrigin);
++  EXPECT_EQ(
++      DecideKeyWebNavigation(Facts(std::string("blob:") + kAppA + "/uuid")),
++      NavigationVerdict::kAllowSameOrigin);
++}
++
++TEST(KeyWebNavigationPolicyTest, InertTargetsAllowed) {
++  EXPECT_EQ(DecideKeyWebNavigation(Facts("about:blank", false)),
++            NavigationVerdict::kAllowInert);
++  EXPECT_EQ(DecideKeyWebNavigation(Facts("about:srcdoc", false)),
++            NavigationVerdict::kAllowInert);
++  EXPECT_EQ(DecideKeyWebNavigation(Facts("data:text/plain,x", false)),
++            NavigationVerdict::kAllowInert);
++}
++
++TEST(KeyWebNavigationPolicyTest, NoGestureBlocked) {
++  EXPECT_EQ(DecideKeyWebNavigation(Facts("https://evil.test/?d=secret")),
++            NavigationVerdict::kBlockNoUserGesture);
++  EXPECT_EQ(DecideKeyWebNavigation(Facts("mailto:x@evil.test?body=secret")),
++            NavigationVerdict::kBlockNoUserGesture);
++}
++
++TEST(KeyWebNavigationPolicyTest, SubframeEgressAlwaysBlocked) {
++  EXPECT_EQ(DecideKeyWebNavigation(
++                Facts("https://evil.test/?d=secret", false, /*gesture=*/true)),
++            NavigationVerdict::kBlockSubframe);
++}
++
++TEST(KeyWebNavigationPolicyTest, OtherKeyIsOutbound) {
++  EXPECT_EQ(DecideKeyWebNavigation(Facts(
++                "key-web://"
++                "aerugqztij5biqquuk3mfwpsaibuegaqcitgfchwuosuofdjabzqaaic.key/",
++                true, true)),
++            NavigationVerdict::kConfirmInNewContext);
++}
++
++TEST(KeyWebNavigationPolicyTest, GestureNeedsConfirmation) {
++  EXPECT_EQ(DecideKeyWebNavigation(
++                Facts("https://example.org/help", true, /*gesture=*/true)),
++            NavigationVerdict::kConfirmInNewContext);
++}
++
++TEST(KeyWebNavigationPolicyTest, SpeculationRulesIgnored) {
++  NavigationFacts facts = Facts("https://evil.test/", true, true);
++  facts.is_speculative = true;
++  EXPECT_EQ(DecideKeyWebNavigation(facts),
++            NavigationVerdict::kCancelSpeculative);
++}
++
++}  // namespace
++}  // namespace key_web
+diff --git a/chrome/browser/key_web/key_web_navigation_throttle.cc b/chrome/browser/key_web/key_web_navigation_throttle.cc
+new file mode 100644
+--- /dev/null
++++ b/chrome/browser/key_web/key_web_navigation_throttle.cc
+@@ -0,0 +1,198 @@
++// Copyright 2026 The Key-Origin Web Authors
++// SPDX-License-Identifier: BSD-3-Clause
++
++#include "chrome/browser/key_web/key_web_navigation_throttle.h"
++
++#include <memory>
++#include <optional>
++#include <string>
++
++#include "base/feature_list.h"
++#include "base/functional/bind.h"
++#include "base/location.h"
++#include "base/strings/strcat.h"
++#include "base/strings/utf_string_conversions.h"
++#include "base/task/sequenced_task_runner.h"
++#include "chrome/browser/ui/tab_modal_confirm_dialog.h"
++#include "chrome/browser/ui/tab_modal_confirm_dialog_delegate.h"
++#include "chrome/common/chrome_features.h"
++#include "content/public/browser/global_routing_id.h"
++#include "content/public/browser/navigation_handle.h"
++#include "content/public/browser/navigation_throttle_registry.h"
++#include "content/public/browser/page_navigator.h"
++#include "content/public/browser/render_frame_host.h"
++#include "content/public/browser/web_contents.h"
++#include "third_party/blink/public/mojom/devtools/console_message.mojom-shared.h"
++#include "ui/base/clipboard/scoped_clipboard_writer.h"
++#include "ui/base/mojom/dialog_button.mojom.h"
++#include "ui/base/page_transition_types.h"
++#include "ui/base/window_open_disposition.h"
++
++namespace key_web {
++
++namespace {
++
++// TODO(key-web): move user-visible strings into generated_resources.grd.
++class OutboundLinkDialogDelegate : public TabModalConfirmDialogDelegate {
++ public:
++  OutboundLinkDialogDelegate(content::WebContents* web_contents, GURL url)
++      : TabModalConfirmDialogDelegate(web_contents), url_(std::move(url)) {}
++  ~OutboundLinkDialogDelegate() override = default;
++
++  std::u16string GetTitle() override { return u"Leave this key-web app?"; }
++
++  // NG4: the COMPLETE destination, never truncated or elided. Everything in it
++  // (path, query, fragment) is visible to whoever runs the destination.
++  std::u16string GetDialogMessage() override {
++    return base::StrCat(
++        {u"This app is asking to open the address below. Everything in it, "
++         u"including any text after \"?\" or \"#\", will be sent to that "
++         u"site.\n\n",
++         base::UTF8ToUTF16(url_.possibly_invalid_spec())});
++  }
++
++  std::u16string GetAcceptButtonTitle() override { return u"Open in new tab"; }
++  std::u16string GetCancelButtonTitle() override { return u"Cancel"; }
++  std::u16string GetLinkText() const override { return u"Copy address"; }
++
++  std::optional<int> GetDefaultDialogButton() override {
++    return static_cast<int>(ui::mojom::DialogButton::kCancel);
++  }
++  std::optional<int> GetInitiallyFocusedButton() override {
++    return static_cast<int>(ui::mojom::DialogButton::kCancel);
++  }
++
++ private:
++  void OnAccepted() override {
++    if (!web_contents()) {
++      return;
++    }
++    // NG5: browser-initiated, so there is no initiator origin, no opener and
++    // an empty referrer. The key-web document learns nothing about the result.
++    web_contents()->OpenURL(
++        content::OpenURLParams::CreateBrowserInitiated(
++            url_, WindowOpenDisposition::NEW_FOREGROUND_TAB,
++            ui::PAGE_TRANSITION_LINK),
++        /*navigation_handle_callback=*/{});
++  }
++
++  void OnLinkClicked(ui::mojom::WindowOpenDisposition) override {
++    ui::ScopedClipboardWriter(ui::ClipboardBuffer::kCopyPaste)
++        .WriteText(base::UTF8ToUTF16(url_.possibly_invalid_spec()));
++    Cancel();
++  }
++
++  const GURL url_;
++};
++
++void ShowOutboundLinkDialog(base::WeakPtr<content::WebContents> web_contents,
++                            const GURL& url) {
++  if (!web_contents || web_contents->IsBeingDestroyed()) {
++    return;
++  }
++  TabModalConfirmDialog::Create(
++      std::make_unique<OutboundLinkDialogDelegate>(web_contents.get(), url),
++      web_contents.get());
++}
++
++}  // namespace
++
++void OfferOutboundNavigation(content::WebContents* web_contents,
++                             const GURL& url) {
++  if (!web_contents) {
++    return;
++  }
++  // Never show UI re-entrantly from inside navigation or window-creation
++  // callbacks.
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE,
++      base::BindOnce(&ShowOutboundLinkDialog, web_contents->GetWeakPtr(), url));
++}
++
++// static
++void KeyWebNavigationThrottle::MaybeCreateAndAdd(
++    content::NavigationThrottleRegistry& registry) {
++  // With the feature off, no key-web document can exist (the loader factory
++  // is not registered), so there is nothing to police.
++  if (!base::FeatureList::IsEnabled(features::kKeyOriginWeb)) {
++    return;
++  }
++  registry.AddThrottle(std::make_unique<KeyWebNavigationThrottle>(registry));
++}
++
++KeyWebNavigationThrottle::KeyWebNavigationThrottle(
++    content::NavigationThrottleRegistry& registry)
++    : content::NavigationThrottle(registry) {}
++
++KeyWebNavigationThrottle::~KeyWebNavigationThrottle() = default;
++
++KeyWebNavigationThrottle::ThrottleCheckResult
++KeyWebNavigationThrottle::WillStartRequest() {
++  return Evaluate();
++}
++
++KeyWebNavigationThrottle::ThrottleCheckResult
++KeyWebNavigationThrottle::WillRedirectRequest() {
++  // The key-web loader never redirects except name/bare-ID -> key URL, which
++  // stays same-origin. Re-check anyway: a redirect must not launder egress.
++  return Evaluate();
++}
++
++const char* KeyWebNavigationThrottle::GetNameForLogging() {
++  return "KeyWebNavigationThrottle";
++}
++
++KeyWebNavigationThrottle::ThrottleCheckResult
++KeyWebNavigationThrottle::Evaluate() {
++  content::NavigationHandle* handle = navigation_handle();
++  NavigationFacts facts;
++  facts.initiator_origin = handle->GetInitiatorOrigin();
++  facts.url = handle->GetURL();
++  facts.is_main_frame = handle->IsInMainFrame();
++  facts.has_user_gesture = handle->HasUserGesture();
++  facts.is_speculative =
++      handle->IsInPrerenderedMainFrame() || handle->IsPrerenderedPageActivation();
++
++  switch (DecideKeyWebNavigation(facts)) {
++    case NavigationVerdict::kNotKeyWeb:
++    case NavigationVerdict::kAllowSameOrigin:
++    case NavigationVerdict::kAllowInert:
++      return PROCEED;
++    case NavigationVerdict::kCancelSpeculative:
++      return CANCEL;
++    case NavigationVerdict::kBlockSubframe:
++      LogToInitiator(base::StrCat(
++          {"key-web: blocked a cross-origin frame load of '",
++           facts.url.possibly_invalid_spec(),
++           "'. key-web apps have no network access in Tier 0."}));
++      return BLOCK_REQUEST;
++    case NavigationVerdict::kBlockNoUserGesture:
++      LogToInitiator(base::StrCat(
++          {"key-web: blocked a navigation to '",
++           facts.url.possibly_invalid_spec(),
++           "' that was not triggered by a user gesture."}));
++      return BLOCK_REQUEST;
++    case NavigationVerdict::kConfirmInNewContext:
++      OfferOutboundNavigation(handle->GetWebContents(), facts.url);
++      return CANCEL;
++  }
++}
++
++void KeyWebNavigationThrottle::LogToInitiator(const std::string& message) {
++  content::NavigationHandle* handle = navigation_handle();
++  const std::optional<blink::LocalFrameToken>& token =
++      handle->GetInitiatorFrameToken();
++  if (!token) {
++    return;
++  }
++  content::RenderFrameHost* initiator =
++      content::RenderFrameHost::FromFrameToken(
++          content::GlobalRenderFrameHostToken(handle->GetInitiatorProcessId(),
++                                              *token));
++  if (initiator) {
++    initiator->AddMessageToConsole(blink::mojom::ConsoleMessageLevel::kError,
++                                   message);
++  }
++}
++
++}  // namespace key_web
+diff --git a/chrome/browser/key_web/key_web_navigation_throttle.h b/chrome/browser/key_web/key_web_navigation_throttle.h
+new file mode 100644
+--- /dev/null
++++ b/chrome/browser/key_web/key_web_navigation_throttle.h
+@@ -0,0 +1,62 @@
++// Copyright 2026 The Key-Origin Web Authors
++// SPDX-License-Identifier: BSD-3-Clause
++
++#ifndef CHROME_BROWSER_KEY_WEB_KEY_WEB_NAVIGATION_THROTTLE_H_
++#define CHROME_BROWSER_KEY_WEB_KEY_WEB_NAVIGATION_THROTTLE_H_
++
++#include "chrome/browser/key_web/key_web_navigation_policy.h"
++#include "content/public/browser/navigation_throttle.h"
++#include "url/gurl.h"
++
++namespace content {
++class NavigationThrottleRegistry;
++class WebContents;
++}  // namespace content
++
++namespace key_web {
++
++// Polices every navigation initiated by a key-web:// document (Spec §2.5).
++//
++//   * same key-web origin                      -> PROCEED           (NG1)
++//   * about:blank / about:srcdoc / data:       -> PROCEED           (inert)
++//   * prerender / speculative                  -> CANCEL            (NG7)
++//   * cross-origin subframe                    -> BLOCK_REQUEST     (ambient)
++//   * cross-origin top level, no user gesture  -> BLOCK_REQUEST     (NG4)
++//   * cross-origin top level, user gesture     -> CANCEL in place, then a
++//     browser-owned prompt shows the FULL URL; "Open" loads it in a new
++//     foreground tab as a browser-initiated navigation: no opener, no
++//     referrer, no key-web initiator                         (NG4 + NG5)
++//
++// The same decision runs again on every redirect. Requests are cancelled
++// before any byte leaves the browser, so a blocked URL is never resolved,
++// connected to, or fetched.
++class KeyWebNavigationThrottle : public content::NavigationThrottle {
++ public:
++  static void MaybeCreateAndAdd(content::NavigationThrottleRegistry& registry);
++
++  explicit KeyWebNavigationThrottle(
++      content::NavigationThrottleRegistry& registry);
++  KeyWebNavigationThrottle(const KeyWebNavigationThrottle&) = delete;
++  KeyWebNavigationThrottle& operator=(const KeyWebNavigationThrottle&) =
++      delete;
++  ~KeyWebNavigationThrottle() override;
++
++  // content::NavigationThrottle:
++  ThrottleCheckResult WillStartRequest() override;
++  ThrottleCheckResult WillRedirectRequest() override;
++  const char* GetNameForLogging() override;
++
++ private:
++  ThrottleCheckResult Evaluate();
++  void LogToInitiator(const std::string& message);
++};
++
++// Shows the browser-owned outbound-link prompt (full URL; Open / Copy /
++// Cancel) over `web_contents`. Used by the throttle and by
++// ChromeContentBrowserClient::CanCreateWindow() for key-web openers.
++void OfferOutboundNavigation(content::WebContents* web_contents,
++                             const GURL& url);
++
++}  // namespace key_web
++
++#endif  // CHROME_BROWSER_KEY_WEB_KEY_WEB_NAVIGATION_THROTTLE_H_
+diff --git a/chrome/browser/predictors/BUILD.gn b/chrome/browser/predictors/BUILD.gn
+--- a/chrome/browser/predictors/BUILD.gn
++++ b/chrome/browser/predictors/BUILD.gn
+@@ -121,6 +121,10 @@
+   if (enable_extensions_core) {
+     deps += [ "//extensions/browser" ]
+   }
++  if (is_win || is_mac || is_linux || is_chromeos) {
++    # key-web frames never emit preconnect / DNS-prefetch hints.
++    deps += [ "//components/webapps/key_web:scheme" ]
++  }
+ }
+ 
+ source_set("test_support") {
+diff --git a/chrome/browser/predictors/network_hints_handler_impl.cc b/chrome/browser/predictors/network_hints_handler_impl.cc
+--- a/chrome/browser/predictors/network_hints_handler_impl.cc
++++ b/chrome/browser/predictors/network_hints_handler_impl.cc
+@@ -7,6 +7,7 @@
+ #include <optional>
+ 
+ #include "base/memory/ptr_util.h"
++#include "build/build_config.h"
+ #include "chrome/browser/predictors/loading_predictor.h"
+ #include "chrome/browser/predictors/loading_predictor_factory.h"
+ #include "chrome/browser/profiles/profile.h"
+@@ -18,6 +19,11 @@
+ #include "net/base/isolation_info.h"
+ #include "net/traffic_annotation/network_traffic_annotation.h"
+ 
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_MAC) || BUILDFLAG(IS_LINUX) || \
++    BUILDFLAG(IS_CHROMEOS)
++#include "components/webapps/key_web/scheme.h"
++#endif
++
+ namespace predictors {
+ 
+ namespace {
+@@ -77,6 +83,27 @@
+       .network_anonymization_key();
+ }
+ 
++// key-web:// documents have zero network egress in Tier 0. Blink's
++// <link rel=preconnect> path ignores both CSP and X-DNS-Prefetch-Control and
++// lands here, so hints from any frame that is, or is nested in, a key-web
++// document are dropped before they reach the PreconnectManager. The
++// network-service Connection-Allowlist (keyed by GetNetworkRestrictionsID())
++// remains the load-bearing control; this is defense in depth that also stops
++// the hint from being attributed to the key-web frame at all.
++bool IsInKeyWebContext(content::RenderFrameHost* render_frame_host) {
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_MAC) || BUILDFLAG(IS_LINUX) || \
++    BUILDFLAG(IS_CHROMEOS)
++  for (content::RenderFrameHost* rfh = render_frame_host; rfh;
++       rfh = rfh->GetParentOrOuterDocument()) {
++    if (rfh->GetLastCommittedOrigin().scheme() == key_web::kKeyWebScheme ||
++        rfh->GetLastCommittedURL().SchemeIs(key_web::kKeyWebScheme)) {
++      return true;
++    }
++  }
++#endif
++  return false;
++}
++
+ }  // namespace
+ 
+ NetworkHintsHandlerImpl::~NetworkHintsHandlerImpl() = default;
+@@ -100,6 +127,10 @@
+   if (!render_frame_host)
+     return;
+ 
++  if (IsInKeyWebContext(render_frame_host)) {
++    return;
++  }
++
+   std::vector<GURL> gurls;
+   for (const auto& url : urls) {
+     gurls.emplace_back(url.GetURL());
+@@ -131,6 +162,10 @@
+   if (!render_frame_host)
+     return;
+ 
++  if (IsInKeyWebContext(render_frame_host)) {
++    return;
++  }
++
+   base::UnguessableToken network_restrictions_id =
+       render_frame_host->GetNetworkRestrictionsID();
+   const content::StoragePartitionConfig& storage_partition_config =
+diff --git a/chrome/test/BUILD.gn b/chrome/test/BUILD.gn
+--- a/chrome/test/BUILD.gn
++++ b/chrome/test/BUILD.gn
+@@ -3017,6 +3017,7 @@
+       "//chrome/browser/glic/selection:unit_tests",
+       "//chrome/browser/glic/suggestions:unit_tests",
+       "//chrome/browser/indigo:unit_tests",
++      "//chrome/browser/key_web:unit_tests",
+       "//chrome/browser/lifetime:unit_tests",
+       "//chrome/browser/metrics/critical_user_journeys:unit_tests",
+       "//chrome/browser/new_tab_page/chrome_colors:generate_colors_info",
+diff --git a/components/webapps/key_web/policy/BUILD.gn b/components/webapps/key_web/policy/BUILD.gn
+new file mode 100644
+--- /dev/null
++++ b/components/webapps/key_web/policy/BUILD.gn
+@@ -0,0 +1,30 @@
++# Copyright 2026 The Key-Origin Web Authors
++# SPDX-License-Identifier: BSD-3-Clause
++
++# Tier 0 response policy for key-web:// (exfiltration-proof CSP,
++# Connection-Allowlist, isolation headers, header sanitizer).
++source_set("policy") {
++  sources = [
++    "header_policy.cc",
++    "header_policy.h",
++  ]
++  deps = [
++    "//base",
++    "//net",
++  ]
++  assert_no_deps = [
++    "//chrome/*",
++    "//components/webapps/isolated_web_apps/*",
++  ]
++}
++
++source_set("unit_tests") {
++  testonly = true
++  sources = [ "header_policy_unittest.cc" ]
++  deps = [
++    ":policy",
++    "//base",
++    "//net",
++    "//testing/gtest",
++  ]
++}
+diff --git a/components/webapps/key_web/policy/header_policy.cc b/components/webapps/key_web/policy/header_policy.cc
+new file mode 100644
+--- /dev/null
++++ b/components/webapps/key_web/policy/header_policy.cc
+@@ -0,0 +1,184 @@
++// Copyright 2026 The Key-Origin Web Authors
++// SPDX-License-Identifier: BSD-3-Clause
++
++#include "components/webapps/key_web/policy/header_policy.h"
++
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/strings/string_split.h"
++#include "base/strings/string_util.h"
++#include "net/http/http_response_headers.h"
++
++namespace key_web {
++
++namespace {
++
++// Spec §2.3. The first four directives are the exfiltration-proof core; the
++// remainder only constrain local resource kinds and add no network source.
++inline constexpr char kKeyWebCsp[] =
++    "default-src 'self';"
++    "connect-src 'none';"
++    "img-src 'self' data: blob:;"
++    "form-action 'none';"
++    "script-src 'self' 'wasm-unsafe-eval';"
++    "style-src 'self' 'unsafe-inline';"
++    "media-src 'self' data: blob:;"
++    "font-src 'self' data: blob:;"
++    "worker-src 'self' blob:;"
++    "frame-src 'self' blob:;"
++    "fenced-frame-src 'none';"
++    "manifest-src 'self';"
++    "object-src 'none';"
++    "base-uri 'none';"
++    "frame-ancestors 'self';"
++    "require-trusted-types-for 'script';";
++
++// Spec §2.4. Report-only lists are never used: reporting is egress.
++inline constexpr char kKeyWebConnectionAllowlist[] =
++    "(response-origin);redirects=block;webrtc=block";
++
++// Spec §2.7, Tier 0. Everything that can reach a sensor, a radio, a
++// peripheral, a payment/credential ceremony or an ad API is denied.
++inline constexpr char kKeyWebPermissionsPolicy[] =
++    "accelerometer=(), ambient-light-sensor=(), attribution-reporting=(), "
++    "autoplay=(self), bluetooth=(), browsing-topics=(), camera=(), "
++    "clipboard-read=(), clipboard-write=(self), controlled-frame=(), "
++    "cross-origin-isolated=(self), direct-sockets=(), display-capture=(), "
++    "encrypted-media=(), fullscreen=(self), gamepad=(self), geolocation=(), "
++    "gyroscope=(), hid=(), identity-credentials-get=(), idle-detection=(), "
++    "join-ad-interest-group=(), keyboard-map=(self), local-fonts=(), "
++    "magnetometer=(), microphone=(), midi=(), otp-credentials=(), payment=(), "
++    "picture-in-picture=(self), private-state-token-issuance=(), "
++    "private-state-token-redemption=(), publickey-credentials-create=(), "
++    "publickey-credentials-get=(), run-ad-auction=(), screen-wake-lock=(self), "
++    "serial=(), shared-storage=(), shared-storage-select-url=(), "
++    "storage-access=(), usb=(), web-share=(), window-management=()";
++
++// Spec §2.6 (L5). App-supplied copies of these are always removed.
++inline constexpr const char* kStrippedHeaders[] = {
++    // Reporting is an egress channel.
++    "Report-To",
++    "Reporting-Endpoints",
++    "NEL",
++    "Content-Security-Policy-Report-Only",
++    "Cross-Origin-Embedder-Policy-Report-Only",
++    "Cross-Origin-Opener-Policy-Report-Only",
++    "Document-Policy-Report-Only",
++    // Only the UA sets the allowlist (a second list would also trip
++    // ConnectionAllowlistIssue::kMoreThanOneList).
++    "Connection-Allowlist",
++    "Connection-Allowlist-Report-Only",
++    "Allow-Connection-Allowlist-From",
++    // preconnect / dns-prefetch / preload / modulepreload hints.
++    "Link",
++    // Navigation and speculation vectors.
++    "Refresh",
++    "Speculation-Rules",
++    "Supports-Loading-Mode",
++    // Meaningless (or dangerous) for a non-network origin.
++    "Set-Cookie",
++    "Accept-CH",
++    "Critical-CH",
++    "Alt-Svc",
++    "Strict-Transport-Security",
++    "Clear-Site-Data",
++    // Replaced by UA values below.
++    "Permissions-Policy",
++    "Cross-Origin-Opener-Policy",
++    "Cross-Origin-Embedder-Policy",
++    "Cross-Origin-Resource-Policy",
++    "Referrer-Policy",
++    "Origin-Agent-Cluster",
++    "X-DNS-Prefetch-Control",
++    "X-Content-Type-Options",
++};
++
++bool IsReportingDirective(std::string_view directive) {
++  std::string_view trimmed =
++      base::TrimWhitespaceASCII(directive, base::TRIM_ALL);
++  size_t end = trimmed.find_first_of(" \t");
++  std::string_view name =
++      end == std::string_view::npos ? trimmed : trimmed.substr(0, end);
++  return base::EqualsCaseInsensitiveASCII(name, "report-uri") ||
++         base::EqualsCaseInsensitiveASCII(name, "report-to");
++}
++
++}  // namespace
++
++std::string_view GetKeyWebContentSecurityPolicy() {
++  return kKeyWebCsp;
++}
++
++std::string_view GetKeyWebConnectionAllowlist() {
++  return kKeyWebConnectionAllowlist;
++}
++
++std::string_view GetKeyWebPermissionsPolicy() {
++  return kKeyWebPermissionsPolicy;
++}
++
++std::string StripCspReportingDirectives(std::string_view csp_value) {
++  // A header value may carry several comma-separated policies, each a list of
++  // semicolon-separated directives. Only whole directives are dropped; the
++  // value is never otherwise interpreted here (the network service parses it).
++  std::vector<std::string> policies;
++  for (std::string_view policy :
++       base::SplitStringPiece(csp_value, ",", base::TRIM_WHITESPACE,
++                              base::SPLIT_WANT_NONEMPTY)) {
++    std::vector<std::string_view> kept;
++    for (std::string_view directive :
++         base::SplitStringPiece(policy, ";", base::TRIM_WHITESPACE,
++                                base::SPLIT_WANT_NONEMPTY)) {
++      if (!IsReportingDirective(directive)) {
++        kept.push_back(directive);
++      }
++    }
++    if (!kept.empty()) {
++      policies.push_back(base::JoinString(kept, "; "));
++    }
++  }
++  return base::JoinString(policies, ", ");
++}
++
++void SanitizeKeyWebResponseHeaders(net::HttpResponseHeaders& headers) {
++  for (const char* name : kStrippedHeaders) {
++    headers.RemoveHeader(name);
++  }
++
++  std::vector<std::string> app_csps;
++  size_t iter = 0;
++  while (std::optional<std::string_view> value =
++             headers.EnumerateHeader(&iter, "Content-Security-Policy")) {
++    app_csps.emplace_back(StripCspReportingDirectives(*value));
++  }
++  headers.RemoveHeader("Content-Security-Policy");
++  for (const std::string& csp : app_csps) {
++    if (!csp.empty()) {
++      headers.AddHeader("Content-Security-Policy", csp);
++    }
++  }
++}
++
++void SetRequiredHeadersForKeyWeb(net::HttpResponseHeaders& headers) {
++  SanitizeKeyWebResponseHeaders(headers);
++
++  // Added next to the app's (now report-free) policies: both are enforced,
++  // so the app can only make things stricter.
++  headers.AddHeader("Content-Security-Policy", kKeyWebCsp);
++  headers.SetHeader("Connection-Allowlist", kKeyWebConnectionAllowlist);
++  headers.SetHeader("Cross-Origin-Opener-Policy", "same-origin");
++  headers.SetHeader("Cross-Origin-Embedder-Policy", "require-corp");
++  headers.SetHeader("Cross-Origin-Resource-Policy", "same-origin");
++  headers.SetHeader("Origin-Agent-Cluster", "?1");
++  headers.SetHeader("Referrer-Policy", "no-referrer");
++  // Irreversible per document; switches off Blink's <link rel=dns-prefetch>.
++  headers.SetHeader("X-DNS-Prefetch-Control", "off");
++  headers.SetHeader("X-Content-Type-Options", "nosniff");
++  headers.SetHeader("Permissions-Policy", kKeyWebPermissionsPolicy);
++  headers.SetHeader("Cache-Control", "no-store");
++}
++
++}  // namespace key_web
+diff --git a/components/webapps/key_web/policy/header_policy.h b/components/webapps/key_web/policy/header_policy.h
+new file mode 100644
+--- /dev/null
++++ b/components/webapps/key_web/policy/header_policy.h
+@@ -0,0 +1,60 @@
++// Copyright 2026 The Key-Origin Web Authors
++// SPDX-License-Identifier: BSD-3-Clause
++
++#ifndef COMPONENTS_WEBAPPS_KEY_WEB_POLICY_HEADER_POLICY_H_
++#define COMPONENTS_WEBAPPS_KEY_WEB_POLICY_HEADER_POLICY_H_
++
++#include <string>
++#include <string_view>
++
++namespace net {
++class HttpResponseHeaders;
++}  // namespace net
++
++namespace key_web {
++
++// The exfiltration-proof default Content-Security-Policy enforced on every
++// key-web response (documents, workers, service workers). It is ADDED next to
++// any policy the app ships, so an app can only tighten it.
++//
++// Core (no network source anywhere):
++//   default-src 'self'; connect-src 'none'; img-src 'self' data: blob:;
++//   form-action 'none'
++// plus hardening directives that never add a network source.
++//
++// There is deliberately no `navigate-to`: Chromium 160 does not implement it
++// (absent from network::mojom::CSPDirectiveName) and unknown directives are
++// ignored. Outbound navigation is enforced by KeyWebNavigationThrottle.
++std::string_view GetKeyWebContentSecurityPolicy();
++
++// `Connection-Allowlist: (response-origin);redirects=block;webrtc=block`.
++// response-origin resolves to key-web://<kw-id>.key, which is not a network
++// endpoint, so the effective network allowlist is empty. The network service
++// enforces it per document for DNS resolution, socket preconnect, prefetch,
++// WebTransport and WebRTC: exactly the paths CSP cannot see.
++std::string_view GetKeyWebConnectionAllowlist();
++
++// Tier 0 Permissions-Policy baseline (local presentation only).
++std::string_view GetKeyWebPermissionsPolicy();
++
++// Removes every app-supplied header that could open an egress channel,
++// loosen UA policy, or trigger a second Connection-Allowlist (L5). Also strips
++// `report-uri` / `report-to` directives from app-supplied CSP headers, since a
++// violation report is itself an egress.
++void SanitizeKeyWebResponseHeaders(net::HttpResponseHeaders& headers);
++
++// Sanitizes, then injects the UA policy: CSP (appended), Connection-Allowlist,
++// COOP/COEP/CORP, Origin-Agent-Cluster, Referrer-Policy, X-DNS-Prefetch-
++// Control: off, X-Content-Type-Options and Permissions-Policy.
++//
++// All injected values are compile-time constants, so re-parsing them in the
++// network service (as the IWA loader does) keeps the Rule of 2.
++void SetRequiredHeadersForKeyWeb(net::HttpResponseHeaders& headers);
++
++// Exposed for tests: removes report-uri/report-to directives from one
++// Content-Security-Policy header value (which may hold several policies).
++std::string StripCspReportingDirectives(std::string_view csp_value);
++
++}  // namespace key_web
++
++#endif  // COMPONENTS_WEBAPPS_KEY_WEB_POLICY_HEADER_POLICY_H_
+diff --git a/components/webapps/key_web/policy/header_policy_unittest.cc b/components/webapps/key_web/policy/header_policy_unittest.cc
+new file mode 100644
+--- /dev/null
++++ b/components/webapps/key_web/policy/header_policy_unittest.cc
+@@ -0,0 +1,105 @@
++// Copyright 2026 The Key-Origin Web Authors
++// SPDX-License-Identifier: BSD-3-Clause
++
++#include "components/webapps/key_web/policy/header_policy.h"
++
++#include <string>
++#include <vector>
++
++#include "base/memory/scoped_refptr.h"
++#include "net/http/http_response_headers.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace key_web {
++namespace {
++
++scoped_refptr<net::HttpResponseHeaders> MaliciousAppHeaders() {
++  return net::HttpResponseHeaders::TryToCreate(
++      "HTTP/1.1 200 OK\r\n"
++      "Content-Type: text/html\r\n"
++      "Content-Security-Policy: script-src 'self'; report-uri https://a.test/r\r\n"
++      "Content-Security-Policy-Report-Only: default-src 'none'; report-to x\r\n"
++      "Reporting-Endpoints: x=\"https://a.test/r\"\r\n"
++      "Report-To: {\"group\":\"x\"}\r\n"
++      "NEL: {\"report_to\":\"x\"}\r\n"
++      "Connection-Allowlist: (*)\r\n"
++      "Allow-Connection-Allowlist-From: *\r\n"
++      "Link: <https://a.test>; rel=preconnect\r\n"
++      "Refresh: 0;url=https://a.test/?d=secret\r\n"
++      "Speculation-Rules: \"/rules.json\"\r\n"
++      "Set-Cookie: a=b\r\n"
++      "Permissions-Policy: camera=*\r\n"
++      "Cross-Origin-Opener-Policy: unsafe-none\r\n"
++      "X-DNS-Prefetch-Control: on\r\n"
++      "\r\n");
++}
++
++std::vector<std::string> AllValues(const net::HttpResponseHeaders& headers,
++                                   std::string_view name) {
++  std::vector<std::string> out;
++  size_t iter = 0;
++  while (auto value = headers.EnumerateHeader(&iter, name)) {
++    out.emplace_back(*value);
++  }
++  return out;
++}
++
++TEST(KeyWebHeaderPolicyTest, CspHasNoNetworkSource) {
++  const std::string csp(GetKeyWebContentSecurityPolicy());
++  EXPECT_NE(csp.find("default-src 'self';"), std::string::npos);
++  EXPECT_NE(csp.find("connect-src 'none';"), std::string::npos);
++  EXPECT_NE(csp.find("img-src 'self' data: blob:;"), std::string::npos);
++  EXPECT_NE(csp.find("form-action 'none';"), std::string::npos);
++  for (const char* scheme : {"https:", "http:", "wss:", "ws:", "*"}) {
++    EXPECT_EQ(csp.find(scheme), std::string::npos) << scheme;
++  }
++  // navigate-to is not implemented in M160; relying on it is false assurance.
++  EXPECT_EQ(csp.find("navigate-to"), std::string::npos);
++  EXPECT_EQ(csp.find("report-"), std::string::npos);
++}
++
++TEST(KeyWebHeaderPolicyTest, AppHeadersCannotLoosen) {
++  auto headers = MaliciousAppHeaders();
++  SetRequiredHeadersForKeyWeb(*headers);
++
++  for (const char* stripped :
++       {"Content-Security-Policy-Report-Only", "Reporting-Endpoints",
++        "Report-To", "NEL", "Allow-Connection-Allowlist-From", "Link",
++        "Refresh", "Speculation-Rules", "Set-Cookie"}) {
++    EXPECT_FALSE(headers->HasHeader(stripped)) << stripped;
++  }
++  EXPECT_EQ(AllValues(*headers, "Connection-Allowlist"),
++            std::vector<std::string>{
++                std::string(GetKeyWebConnectionAllowlist())});
++  EXPECT_EQ(AllValues(*headers, "Cross-Origin-Opener-Policy"),
++            std::vector<std::string>{"same-origin"});
++  EXPECT_EQ(AllValues(*headers, "X-DNS-Prefetch-Control"),
++            std::vector<std::string>{"off"});
++  EXPECT_EQ(AllValues(*headers, "Permissions-Policy"),
++            std::vector<std::string>{
++                std::string(GetKeyWebPermissionsPolicy())});
++}
++
++TEST(KeyWebHeaderPolicyTest, CspReportUriStripped) {
++  auto headers = MaliciousAppHeaders();
++  SetRequiredHeadersForKeyWeb(*headers);
++  std::vector<std::string> csps =
++      AllValues(*headers, "Content-Security-Policy");
++  ASSERT_EQ(csps.size(), 2u);
++  EXPECT_EQ(csps[0], "script-src 'self'");  // the app's, minus reporting
++  EXPECT_EQ(csps[1], GetKeyWebContentSecurityPolicy());
++  for (const std::string& csp : csps) {
++    EXPECT_EQ(csp.find("report-"), std::string::npos) << csp;
++  }
++}
++
++TEST(KeyWebHeaderPolicyTest, StripCspReportingDirectives) {
++  EXPECT_EQ(StripCspReportingDirectives(
++                "default-src 'none'; REPORT-URI https://a.test, "
++                "img-src 'self'; report-to g"),
++            "default-src 'none', img-src 'self'");
++  EXPECT_EQ(StripCspReportingDirectives("report-uri /x"), "");
++}
++
++}  // namespace
++}  // namespace key_web

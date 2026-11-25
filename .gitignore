@@ -1,0 +1,18 @@
+node_modules/
+dist/
+out/
+.run/
+.packager/
+*.log
+.DS_Store
+
+# Never commit build bundles or private key material
+*.swbn
+*.wbn
+*.pem
+*.key
+*.p8
+*.p12
+*.pfx
+.env
+.env.*

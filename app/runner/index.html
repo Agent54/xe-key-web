@@ -1,0 +1,291 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>KeyWeb Runner</title>
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="manifest" href=".well-known/manifest.webmanifest">
+  <link rel="stylesheet" href="app.css">
+  <script type="module" src="src/main.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <img src="icon.svg" alt="" width="30" height="30">
+      <div>
+        <h1>KeyWeb Runner</h1>
+        <p>The key is the origin. The transport is nobody.</p>
+      </div>
+    </div>
+    <nav class="tabs" role="tablist" aria-label="Views">
+      <button type="button" role="tab" id="tab-browse" class="tab" aria-controls="view-browse" aria-selected="true">Browse</button>
+      <button type="button" role="tab" id="tab-names" class="tab" aria-controls="view-names" aria-selected="false">Names, pins and key rotation</button>
+    </nav>
+    <div class="net">
+      <span class="net-pill" id="net-pill" role="status">Checking the network</span>
+      <button type="button" id="net-toggle" class="btn btn-danger">Kill all servers</button>
+    </div>
+  </header>
+
+  <main>
+    <section id="view-browse" class="view browse" role="tabpanel" aria-labelledby="tab-browse">
+      <aside class="rail" aria-label="Links and transports">
+        <section class="panel">
+          <h2>Key-web links</h2>
+          <p class="hint">A link names a signing key, not a server. The readable ones are looked up on a rail and pinned; the <code>.key</code> one is the key itself. Every one of them opens the same origin and the same data.</p>
+          <ul id="links" class="links"></ul>
+        </section>
+
+        <section class="panel">
+          <h2>Out of band</h2>
+          <p class="hint">A bundle from a USB stick, a chat message or a QR code is as good as one from a server.</p>
+          <div id="dropzone" class="dropzone" tabindex="0" role="button" aria-label="Drop a .swbn file here, or press Enter to choose one">
+            <strong>Drop a .swbn file</strong>
+            <span>or choose one</span>
+            <input type="file" id="file-input" class="visually-hidden" accept=".swbn,application/octet-stream" tabindex="-1">
+          </div>
+          <label class="field" for="paste">Or paste it as base64</label>
+          <textarea id="paste" class="paste" rows="3" spellcheck="false" autocomplete="off" placeholder="base64, base64url or a data: URL"></textarea>
+          <div class="row">
+            <button type="button" id="paste-load" class="btn">Open pasted bundle</button>
+            <button type="button" id="paste-clear" class="btn btn-quiet">Clear</button>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2>Transport settings</h2>
+          <label class="check">
+            <input type="checkbox" id="poison">
+            <span>Poison peer #2 <small>It serves one corrupted chunk. Watch the swarm catch it.</small></span>
+          </label>
+          <div class="cache-line">
+            <span id="cache-info">Offline cache: empty</span>
+            <button type="button" id="cache-clear" class="btn btn-quiet">Empty the cache</button>
+          </div>
+        </section>
+      </aside>
+
+      <section class="stage" aria-label="Browser">
+        <form class="omnibox" id="omnibox" autocomplete="off">
+          <div class="identity">
+            <span id="tier" class="tier tier-idle">No app open</span>
+            <button type="button" id="trust-pill" class="trust-pill" aria-expanded="false" aria-controls="trust-panel" hidden></button>
+            <span id="name-chip" class="name-chip" hidden></span>
+          </div>
+          <div class="address-row">
+            <input id="address" class="address" type="text" spellcheck="false" aria-label="Key-web address" placeholder="key-web://localpad.lukeinth.at/">
+            <button type="submit" class="btn">Go</button>
+            <button type="button" id="copy-link" class="btn" disabled>Copy shareable link</button>
+            <button type="button" id="reload" class="btn btn-quiet" disabled>Reload</button>
+            <button type="button" id="close" class="btn btn-quiet" disabled>Close</button>
+          </div>
+        </form>
+
+        <div id="trust-panel" class="trust-panel" role="region" aria-label="How this address was trusted" hidden>
+          <p id="trust-summary" class="trust-summary"></p>
+          <dl id="trust-facts" class="facts"></dl>
+          <div class="row">
+            <button type="button" id="trust-copy-name" class="btn btn-small">Copy shareable link</button>
+            <button type="button" id="trust-copy-key" class="btn btn-small">Copy the self-certifying link</button>
+            <button type="button" id="trust-close" class="btn btn-small btn-quiet">Close</button>
+          </div>
+        </div>
+
+        <div id="notice" class="notice" hidden></div>
+
+        <div class="viewport" id="viewport">
+          <div id="start" class="start">
+            <h2>Click a key-web link</h2>
+            <p>Nothing here is installed, and nothing asks for permission. A link opens a signed app in a sandbox it cannot send anything out of.</p>
+            <ol class="start-steps">
+              <li><strong>Resolve.</strong> A readable name such as <code>key-web://localpad.lukeinth.at/</code> is looked up on its rail, then checked against the key pinned the first time you used it.</li>
+              <li><strong>Fetch.</strong> Bytes arrive from a mirror, a swarm of peers, a file, or the local cache.</li>
+              <li><strong>Verify.</strong> The Ed25519 signature is checked right here, in this page, before any byte is parsed.</li>
+              <li><strong>Derive.</strong> The origin is the signing key, whatever name led to it. Same key, same origin, same data.</li>
+              <li><strong>Run.</strong> Tier 0: no network of any kind until you grant one narrow capability.</li>
+            </ol>
+          </div>
+          <div id="blocked" class="blocked" hidden>
+            <p class="blocked-code" id="blocked-code"></p>
+            <p class="blocked-text" id="blocked-text"></p>
+            <p class="blocked-foot">Nothing from these bytes was rendered, stored or run.</p>
+          </div>
+          <div id="grant" class="grant-shade" hidden>
+            <div class="grant-card" role="alertdialog" aria-modal="true" aria-labelledby="grant-title">
+              <p class="grant-who" id="grant-who"></p>
+              <h2 id="grant-title"></h2>
+              <p class="grant-what" id="grant-what"></p>
+              <ul class="grant-limits" id="grant-limits"></ul>
+              <p class="grant-reason-label">The app says why:</p>
+              <blockquote class="grant-reason" id="grant-reason"></blockquote>
+              <div class="grant-actions">
+                <button type="button" id="grant-deny" class="btn">Deny</button>
+                <button type="button" id="grant-once" class="btn btn-primary">Grant once</button>
+                <button type="button" id="grant-timed" class="btn btn-primary">Grant 5 min</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <footer class="statusbar">
+          <span id="status-policy" class="status-item">Sandbox idle</span>
+          <span id="status-ledger" class="status-item status-ledger">Tracker ledger: not read yet</span>
+        </footer>
+      </section>
+
+      <aside class="inspector" aria-label="Inspector">
+        <section class="panel">
+          <h2>Transport</h2>
+          <ol id="trace" class="trace"><li class="empty">No bundle fetched yet.</li></ol>
+          <div id="swarm" class="swarm" hidden>
+            <div id="swarm-grid" class="swarm-grid" aria-label="Chunks, coloured by the peer that delivered each one"></div>
+            <ul class="swarm-legend">
+              <li class="peer-1">Peer 1</li>
+              <li class="peer-2">Peer 2</li>
+              <li class="peer-3">Peer 3</li>
+              <li class="peer-4">Peer 4</li>
+              <li class="peer-bad">Poisoned</li>
+            </ul>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2>Verification</h2>
+          <p id="verdict" class="verdict verdict-idle">Waiting for bytes.</p>
+          <ol id="steps" class="steps"></ol>
+          <div class="row">
+            <button type="button" id="tamper" class="btn btn-danger" disabled>Tamper 1 byte</button>
+            <button type="button" id="restore" class="btn" hidden>Restore the original</button>
+          </div>
+          <p id="tamper-note" class="hint" hidden></p>
+        </section>
+
+        <section class="panel">
+          <h2>Sandbox telemetry</h2>
+          <p class="hint">Policy violations as the browser itself reports them. The app cannot hide or forge these.</p>
+          <ol id="telemetry" class="telemetry"><li class="empty">Nothing blocked yet.</li></ol>
+        </section>
+
+        <section class="panel">
+          <h2>Capabilities</h2>
+          <ul id="grants" class="grants"><li class="empty">Tier 0. Nothing granted.</li></ul>
+          <ol id="cap-log" class="cap-log"></ol>
+        </section>
+
+        <section class="panel">
+          <h2>Bundle</h2>
+          <dl id="facts" class="facts"><dt>Origin</dt><dd>No bundle verified yet.</dd></dl>
+          <details class="resources">
+            <summary id="resources-summary">Resources</summary>
+            <ul id="resources"></ul>
+          </details>
+        </section>
+      </aside>
+    </section>
+
+    <section id="view-names" class="view names" role="tabpanel" aria-labelledby="tab-names" hidden>
+      <div class="names-column">
+        <section class="panel">
+          <h2>Readable names and resolver rails</h2>
+          <p class="hint">A name like <code>key-web://localpad.lukeinth.at/</code> is looked up on a rail, which answers with a record signed by the publisher: "this name is this key". The rail is never trusted for that. The first key a name resolves to is pinned here, and after that the pin decides. A rail can be down, or taken over, and a pinned name still means what it meant.</p>
+
+          <div class="rail-row" id="rail-at">
+            <div class="rail-head">
+              <strong class="mono">.at</strong>
+              <span>ATProto handle rail (simulated)</span>
+              <span id="rail-at-state" class="rail-state">checking</span>
+            </div>
+            <div class="row">
+              <button type="button" id="rail-at-kill" class="btn btn-danger" disabled>Kill the .at resolver</button>
+              <button type="button" id="rail-at-hijack" class="btn btn-danger" disabled>Simulate handle hijack (lukeinth.at → evil key)</button>
+              <button type="button" id="rail-at-rotate" class="btn" disabled>Publish the signed key rotation on .at</button>
+            </div>
+          </div>
+          <div class="rail-row" id="rail-dht">
+            <div class="rail-head">
+              <strong class="mono">.dht</strong>
+              <span>PKARR / Mainline DHT rail (simulated)</span>
+              <span id="rail-dht-state" class="rail-state">checking</span>
+            </div>
+            <div class="row">
+              <button type="button" id="rail-dht-kill" class="btn btn-danger" disabled>Kill the .dht resolver</button>
+            </div>
+          </div>
+          <p id="rail-message" class="message" hidden></p>
+
+          <div class="row">
+            <button type="button" class="btn btn-primary" data-open-address="key-web://localpad.lukeinth.at/">Open key-web://localpad.lukeinth.at/</button>
+            <button type="button" class="btn" data-open-address="key-web://localpad.lukeinth.dht/">Open key-web://localpad.lukeinth.dht/</button>
+          </div>
+
+          <table class="book">
+            <thead><tr><th scope="col">Pinned name</th><th scope="col">Pinned key</th><th scope="col">Since</th><th scope="col"><span class="visually-hidden">Actions</span></th></tr></thead>
+            <tbody id="pin-rows"></tbody>
+          </table>
+        </section>
+
+        <section class="panel">
+          <h2>Petname book</h2>
+          <p class="hint">A signature tells you which key published an app. It cannot tell you who that is. A petname is a name you chose, kept on this machine, bound to exactly one key.</p>
+          <form id="petname-form" class="petname-form" autocomplete="off">
+            <label class="field" for="petname-name">Petname</label>
+            <input id="petname-name" type="text" maxlength="40" placeholder="Trusted Notes">
+            <label class="field" for="petname-key">Key origin</label>
+            <input id="petname-key" type="text" spellcheck="false" placeholder="key-web://… or a 56-character key ID">
+            <div class="row">
+              <button type="submit" class="btn btn-primary">Bind petname</button>
+              <button type="button" id="petname-current" class="btn btn-quiet">Use the open app's key</button>
+            </div>
+          </form>
+          <p id="petname-message" class="message" hidden></p>
+          <table class="book">
+            <thead><tr><th scope="col">Petname</th><th scope="col">Key fingerprint</th><th scope="col">Key origin</th><th scope="col"><span class="visually-hidden">Actions</span></th></tr></thead>
+            <tbody id="petname-rows"></tbody>
+          </table>
+        </section>
+
+        <section class="panel">
+          <h2>Impersonation test</h2>
+          <p class="hint">An attacker copies LocalPad, signs it with their own key and calls it “LocalPad”. The signature is perfectly valid. Only a petname catches it.</p>
+          <div class="row">
+            <button type="button" id="quick-bind" class="btn">Bind “LocalPad” to the real key</button>
+            <button type="button" id="open-impostor" class="btn btn-danger">Open the impostor bundle</button>
+            <button type="button" id="bind-impostor" class="btn btn-quiet">Try to bind “LocalPad” to the impostor's key</button>
+          </div>
+        </section>
+      </div>
+
+      <div class="names-column">
+        <section class="panel">
+          <h2>Key rotation, committed in advance</h2>
+          <p class="hint">LocalPad's signed bundle carries the hash of the only key allowed to take over. A rotation certificate must be signed by the old key, name a new key matching that hash, and be signed by the new key too.</p>
+          <dl id="rotation-state" class="facts"></dl>
+          <div class="row rotation-actions">
+            <button type="button" class="btn btn-primary" data-certificate="valid">Apply the valid certificate</button>
+            <button type="button" class="btn btn-danger" data-certificate="unsigned">Try an unsigned one</button>
+            <button type="button" class="btn btn-danger" data-certificate="forged">Try one forged by a stranger</button>
+            <button type="button" class="btn btn-danger" data-certificate="stolen-key">Try a stolen old key, new attacker key</button>
+          </div>
+          <div class="row">
+            <button type="button" id="rotation-open" class="btn">Open LocalPad by its old link</button>
+            <button type="button" id="rotation-reset" class="btn btn-quiet">Forget accepted rotations</button>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2>Certificate check</h2>
+          <p id="rotation-verdict" class="verdict verdict-idle">No certificate checked yet.</p>
+          <ol id="rotation-steps" class="steps"></ol>
+          <ol id="rotation-log" class="cap-log"></ol>
+          <details class="resources">
+            <summary>Certificate as received</summary>
+            <pre id="rotation-certificate" class="certificate"></pre>
+          </details>
+        </section>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

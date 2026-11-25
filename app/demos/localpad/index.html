@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>LocalPad</title>
+  <link rel="icon" href="icon-192.png" type="image/png">
+  <link rel="stylesheet" href="base.css">
+  <link rel="stylesheet" href="app.css">
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <header class="hero">
+    <img class="hero-cover" src="cover.png" alt="" width="400" height="150">
+    <div class="hero-text">
+      <img src="icon-192.png" alt="" width="44" height="44">
+      <div>
+        <h1>LocalPad</h1>
+        <p>Local-first notes and a sketchpad. Nothing here ever leaves this origin.</p>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <section class="card" aria-labelledby="proof-title">
+      <h2 id="proof-title">Same key, same origin, same data</h2>
+      <p id="proof" class="proof">Reading this origin's storage.</p>
+      <dl class="facts">
+        <dt>Storage belongs to</dt>
+        <dd id="origin" class="mono"></dd>
+        <dt>Found when this page opened</dt>
+        <dd id="found"></dd>
+      </dl>
+      <ul id="transports" class="chips" aria-label="Transports this origin has been opened through"></ul>
+    </section>
+
+    <section class="card" aria-labelledby="notes-title">
+      <h2 id="notes-title">Notes</h2>
+      <form id="note-form" class="note-form">
+        <label class="visually-hidden" for="note-text">New note</label>
+        <textarea id="note-text" rows="2" maxlength="2000" placeholder="Write a note. It is saved in this key origin's own storage, on this machine."></textarea>
+        <button type="submit" class="btn btn-primary">Add note</button>
+      </form>
+      <ul id="notes" class="notes"></ul>
+    </section>
+
+    <section class="card" aria-labelledby="sketch-title">
+      <h2 id="sketch-title">Sketchpad</h2>
+      <canvas id="sketch" class="sketch" width="720" height="260" aria-label="Sketchpad. Draw with a mouse, pen or finger."></canvas>
+      <div class="row">
+        <button type="button" id="sketch-clear" class="btn">Clear the sketch</button>
+        <span id="sketch-info" class="hint"></span>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.run/
+.DS_Store
+
+# never commit key material
+*.pem
+*.key
+*.p8
+*.p12
+*.pfx
+.env
+.env.*

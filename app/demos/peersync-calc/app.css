@@ -1,0 +1,89 @@
+/* Copyright (c) 2026 KeyWeb Runner authors. BSD-3-Clause (see LICENSE). */
+
+:root {
+  --accent: #35c2a1;
+  --accent-ink: #062019;
+}
+
+.calc-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 14px;
+}
+
+.calc-layout .card {
+  margin-bottom: 0;
+}
+
+.card-wide {
+  grid-column: 1 / -1;
+}
+
+.display {
+  display: block;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg);
+  font: 600 24px/1.2 var(--mono);
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
+.keys {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.key {
+  padding: 11px 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: var(--text);
+  font: 600 15px var(--mono);
+  cursor: pointer;
+}
+
+.key:hover {
+  border-color: var(--muted);
+}
+
+.key-op {
+  color: var(--accent);
+}
+
+.key-equals {
+  grid-column: 1 / -1;
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--accent-ink);
+}
+
+.tape {
+  max-height: 232px;
+  margin-top: 8px;
+  overflow-y: auto;
+}
+
+.tape li {
+  padding: 4px 0;
+  border-top: 1px solid var(--line);
+  font: 13px var(--mono);
+}
+
+.tier {
+  font-size: 13px;
+}
+
+@media (max-width: 560px) {
+  .calc-layout {
+    display: block;
+  }
+
+  .calc-layout .card {
+    margin-bottom: 14px;
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "name": "@key-web/resolver",
+  "version": "0.1.0",
+  "description": "Zero-dependency multi-rail key-web:// name resolver with TOFU pinning, cross-rail equivalence, handle-hijack fail-closed detection and KERI pre-rotation verification.",
+  "license": "BSD-3-Clause",
+  "type": "module",
+  "main": "./src/index.mjs",
+  "exports": {
+    ".": "./src/index.mjs",
+    "./fixtures": "./src/fixtures.mjs"
+  },
+  "bin": {
+    "keyweb-resolve": "./bin/keyweb-resolve.mjs"
+  },
+  "files": [
+    "bin",
+    "src",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "demo": "node bin/keyweb-resolve.mjs demo"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

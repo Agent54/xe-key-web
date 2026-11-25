@@ -1,0 +1,105 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 The Key-Origin Web Authors. See LICENSE.
+#
+# Unified CI for xe-key-web: runs KeyWeb Runner (app/) gates + tests + 6-bundle
+# build, multi-rail resolver (resolver/) tests + demo, and chromium-patches/
+# unified-diff hunk-math & BSD-3-Clause hygiene verification.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  NO_COLOR: '1'
+
+jobs:
+  verify:
+    runs-on: [linux-x86_64, xe-ci]
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: https://data.forgejo.org/actions/checkout@v4  # fg-gate-allow: CI checkout action
+
+      - name: Check Node 22+ and Python 3
+        run: |
+          node -e 'const m = Number(process.versions.node.split(".")[0]); if (m < 22) { console.error("need node >= 22, have " + process.version); process.exit(1); }'
+          node --version
+          python3 --version
+
+      - name: KeyWeb Runner (app/) gates & tests
+        working-directory: app
+        run: |
+          node scripts/zero-sink-check.mjs
+          node scripts/hygiene-check.mjs
+          node scripts/make-icons.mjs --check
+          node --test tests/*.test.mjs
+          node scripts/build-swbn.mjs --out dist
+          if grep -rlaE -- '-----BEGIN ([A-Z0-9 ]+ )?PRIVATE KEY-----' dist/ ; then
+            echo "::error::private key material in build output"
+            exit 1
+          fi
+          (cd dist && sha256sum -- *.swbn *.wbn demo-bundles/*.swbn)
+
+      - name: Multi-rail resolver (resolver/) tests & demo
+        working-directory: resolver
+        run: |
+          node --test tests/*.test.mjs
+          node bin/keyweb-resolve.mjs demo
+
+      - name: Chromium patches (chromium-patches/) format & BSD-3-Clause hygiene
+        run: |
+          python3 - <<'PY'
+          import glob, re, subprocess, sys
+          patches = sorted(glob.glob("chromium-patches/*.patch"))
+          assert len(patches) == 3, f"expected 3 KW patches, got {patches}"
+          for p in patches:
+              r = subprocess.run(["git", "apply", "--stat", p], capture_output=True, text=True)
+              assert r.returncode == 0, f"git apply --stat failed for {p}: {r.stderr}"
+              text = open(p, encoding="utf-8").read()
+              assert "BSD-style license" in text or "BSD-3-Clause" in text, f"missing BSD header in {p}"
+              assert not re.search(r"(?i)\b(?:GPL|AGPL|LGPL)-?[23]\b|GNU General Public", text), f"copyleft bleed in {p}"
+              banned_re = r"/" + r"Users/|/" + r"home/|10\.54\.|192\.168\.|100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\."
+              assert not re.search(banned_re, text), f"private path/IP in {p}"
+              # Verify unified-diff hunk line counts
+              lines = text.splitlines()
+              i = 0
+              hunks = 0
+              while i < len(lines):
+                  m = re.match(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", lines[i])
+                  if not m:
+                      i += 1
+                      continue
+                  hunks += 1
+                  old_exp = int(m.group(2)) if m.group(2) is not None else 1
+                  new_exp = int(m.group(4)) if m.group(4) is not None else 1
+                  old_got = new_got = 0
+                  i += 1
+                  while i < len(lines) and not lines[i].startswith(("@@ ", "diff --git ", "--- ", "+++ ")):
+                      ln = lines[i]
+                      if ln.startswith("\\"):
+                          pass
+                      elif ln.startswith("-"):
+                          old_got += 1
+                      elif ln.startswith("+"):
+                          new_got += 1
+                      elif ln.startswith(" ") or ln == "":
+                          old_got += 1
+                          new_got += 1
+                      else:
+                          break
+                      i += 1
+                  assert old_got == old_exp and new_got == new_exp, f"hunk math mismatch in {p}: -{old_got}/{old_exp} +{new_got}/{new_exp}"
+              print(f"PATCH OK: {p} ({hunks} hunks)")
+          PY
+
+      - name: Repo-wide private key check
+        run: |
+          found="$(find . -path ./.git -prune -o -path ./app/dist -prune -o -type f \( -name '*.pem' -o -name '*.key' -o -name '*.p8' -o -name '*.p12' -o -name '*.pfx' -o -name '.env' -o -name '.env.*' \) -print)"
+          if [ -n "$found" ]; then
+            echo "::error::key-like file in repository: $found"
+            exit 1
+          fi

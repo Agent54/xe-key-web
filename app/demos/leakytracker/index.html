@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>LeakyTracker</title>
+  <link rel="icon" href="icon-192.png" type="image/png">
+  <link rel="stylesheet" href="base.css">
+  <link rel="stylesheet" href="app.css">
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <header class="hero">
+    <img class="hero-cover" src="cover.png" alt="" width="400" height="150">
+    <div class="hero-text">
+      <img src="icon-192.png" alt="" width="44" height="44">
+      <div>
+        <h1>LeakyTracker</h1>
+        <p>A hostile app. It tries, five ways, to send your data to a tracker.</p>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <p id="mode" class="banner" hidden></p>
+
+    <section class="card" aria-labelledby="secret-title">
+      <h2 id="secret-title">What it wants to steal</h2>
+      <p>Like any app, this one holds some of your data. Here it is a made-up secret, planted in its own storage:</p>
+      <p><code id="secret" class="secret"></code></p>
+      <p class="hint">Tracker: <span id="tracker" class="mono"></span></p>
+    </section>
+
+    <section class="card" aria-labelledby="attacks-title">
+      <h2 id="attacks-title">Five ways out</h2>
+      <div class="row">
+        <button type="button" id="run" class="btn btn-primary">Run 5 exfiltration attacks</button>
+        <button type="button" id="undeclared" class="btn">Bonus: ask for a capability it never declared</button>
+      </div>
+      <table class="attacks">
+        <thead>
+          <tr><th scope="col">Channel</th><th scope="col">Result</th><th scope="col">Why</th></tr>
+        </thead>
+        <tbody id="attacks"></tbody>
+      </table>
+      <p id="summary" class="summary" role="status">Not run yet.</p>
+      <ul id="status" class="status"></ul>
+    </section>
+
+    <section class="card" aria-labelledby="gaps-title">
+      <h2 id="gaps-title">Beyond the five: two known gaps</h2>
+      <p class="hint">No policy a web page can set switches off WebRTC or stops a preconnect, so in a stock browser these two get past the sandbox. They are here so the gap is measured instead of assumed away. Closing them is the browser's job. The form attack above shows the second one by accident: the browser opens a socket for the form's navigation before the policy stops it, so the tracker sees a connection with nothing in it.</p>
+      <div class="row">
+        <button type="button" id="gaps" class="btn">Probe the 2 known gaps</button>
+      </div>
+      <table class="attacks">
+        <thead>
+          <tr><th scope="col">Channel</th><th scope="col">Result</th><th scope="col">Why</th></tr>
+        </thead>
+        <tbody id="gap-rows"></tbody>
+      </table>
+      <p id="gap-summary" class="summary" role="status">Not run yet.</p>
+    </section>
+
+    <section class="card" aria-labelledby="works-title">
+      <h2 id="works-title">What still works</h2>
+      <p class="hint">The sandbox is not a blank page. The app's own script, style and images load, it draws, it stores data locally, and you could click straight into it without installing anything or answering a prompt. The header image above is this app's own file, allowed by <code>img-src 'self'</code>; the tracking pixel is the same kind of request to someone else's server.</p>
+    </section>
+  </main>
+</body>
+</html>

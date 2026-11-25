@@ -1,0 +1,6 @@
+{
+  "key_web": 1,
+  "name": "PeerSync Calc",
+  "version": "1.0.0",
+  "capabilities": ["net:sync-relay", "storage:export"]
+}

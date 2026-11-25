@@ -1,0 +1,68 @@
+/* Copyright (c) 2026 KeyWeb Runner authors. BSD-3-Clause (see LICENSE). */
+
+:root {
+  --accent: #f2b23a;
+}
+
+.proof {
+  font-size: 15px;
+}
+
+.note-form {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+}
+
+.note-form textarea {
+  flex: 1;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  resize: vertical;
+}
+
+.notes {
+  margin-top: 10px;
+}
+
+.note {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 8px 0;
+  border-top: 1px solid var(--line);
+}
+
+.note-body {
+  flex: 1;
+  min-width: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.note-time {
+  display: block;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.note-remove {
+  padding: 3px 8px;
+  font-size: 12px;
+}
+
+.sketch {
+  display: block;
+  width: 100%;
+  height: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg);
+  touch-action: none;
+  cursor: crosshair;
+}

@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="KeyWeb Runner">
+  <rect width="256" height="256" rx="56" fill="#14161c"/>
+  <path d="M92 132 176 62l36 34M92 132 60 62" fill="none" stroke="#3a4252" stroke-width="6" stroke-linecap="round"/>
+  <circle cx="176" cy="62" r="13" fill="#35c2a1"/>
+  <circle cx="212" cy="96" r="9" fill="#35c2a1"/>
+  <circle cx="60" cy="62" r="9" fill="#35c2a1"/>
+  <circle cx="92" cy="132" r="33.5" fill="none" stroke="#f2b23a" stroke-width="25"/>
+  <rect x="130" y="120" width="96" height="24" rx="6" fill="#f2b23a"/>
+  <rect x="182" y="138" width="16" height="30" rx="4" fill="#f2b23a"/>
+  <rect x="208" y="138" width="16" height="22" rx="4" fill="#f2b23a"/>
+</svg>

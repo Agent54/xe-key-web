@@ -1,0 +1,1289 @@
+Subject: [PATCH KW3/3] key-web: KeyWebURLLoaderFactory serving verified
+ unprivileged .swbn bundles with zero install ceremony
+
+SPDX-License-Identifier: BSD-3-Clause
+Copyright 2026 The Key-Origin Web Authors
+Target: Chromium 160.0.8176.0 (apply after KW1 and KW2:
+        patch -p1 -d src < this.patch)
+
+A minimal, non-network loader for key-web://<kw-id>.key/ that reuses
+Chromium's own Signed Web Bundle stack and none of the Isolated Web App
+trust machinery.
+
+components/webapps/key_web/url_loading/
+  key_web_reader_cache.*
+    Releases live at <profile>/Key Web Bundles/<kw-id>.swbn. Nothing is
+    installed or registered and no prompt is shown, because nothing is
+    trusted: web_app::SignedWebBundleReader::Create(path,
+    key-web://<kw-id>.key/, verify_signatures=true) parses the integrity
+    block out of process and verifies every signature over SHA-512 of the
+    unsigned bundle. Readers are cached per profile and re-verified when the
+    file changes (generation-checked, so a stale verification never wins).
+  key_web_bundle_validation.*
+    On the web_package::SignedWebBundleIntegrityBlock:
+      * webBundleId must equal the origin's kw-id;
+      * self-certifying identity: some verified signature's public key must
+        derive to the kw-id via SignedWebBundleId::CreateForPublicKey(). This
+        is checked independently of the process-wide IdentityValidator, so
+        IWA key-rotation data can never vouch for a key-web origin;
+      * the `keyWeb` attribute must be present (author intent: an IWA bundle
+        is never replayed as key-web) with v == 1 and an unsigned seq.
+    Every bundle index entry must be same-origin with the key URL.
+  key_web_url_loader_factory.*
+    GET/HEAD only. Name hosts and bare IDs fail with ERR_INVALID_URL.
+    Responses pass through key_web::SetRequiredHeadersForKeyWeb() (KW2) and
+    are then re-parsed by the network service, so navigations and workers
+    enforce exactly the injected CSP and Connection-Allowlist. Missing
+    entries get a synthetic 404 that carries the same policy. Never falls
+    back to the network.
+  key_web_url_rewrite.*
+    BrowserURLHandler: key-web://<kw-id>/ -> key-web://<kw-id>.key/, so one
+    key is always exactly one origin.
+
+chrome/browser/chrome_content_browser_client.cc (all behind kKeyOriginWeb)
+  * CreateNonNetworkNavigationURLLoaderFactory: key-web navigations.
+  * RegisterNonNetworkWorkerMainResourceURLLoaderFactories: workers, only for
+    key-web initiators and locked to that key.
+  * RegisterNonNetworkServiceWorkerUpdateURLLoaderFactories: SW scripts.
+  * RegisterNonNetworkSubresourceURLLoaderFactories: only for key-web
+    initiators, locked to the initiator's key.
+  * GetStoragePartitionConfigForSite: one persistent StoragePartition per
+    key ("k" + b64(SHA-256(ctx || origin))), never an IWA partition.
+  * BrowserURLHandlerCreated: the bare-ID rewrite.
+
+Out of scope (follow-ups): HWM / rollback store and K-SAID KEL validation
+(Spec §1.6, §4), name-host resolution and display (Blueprint KW6), capability
+grants (KW5).
+
+Tests: components_unittests --gtest_filter='KeyWebBundleValidationTest.*:KeyWebUrlRewriteTest.*'
+
+diff --git a/chrome/browser/BUILD.gn b/chrome/browser/BUILD.gn
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -1648,6 +1648,14 @@
+       "//chrome/browser/apps/platform_apps",
+       "//chrome/browser/controlled_frame",
+       "//chrome/browser/ui/webui/extensions_zero_state_promo",
++    ]
++  }
++
++  if (is_win || is_mac || is_linux || is_chromeos) {
++    # key-web:// bundle loader, storage partition and bare-ID rewrite.
++    deps += [
++      "//components/webapps/key_web:origin",
++      "//components/webapps/key_web/url_loading",
+     ]
+   }
+ 
+diff --git a/chrome/browser/chrome_content_browser_client.cc b/chrome/browser/chrome_content_browser_client.cc
+--- a/chrome/browser/chrome_content_browser_client.cc
++++ b/chrome/browser/chrome_content_browser_client.cc
+@@ -616,6 +616,9 @@
+ #include "components/password_manager/core/common/password_manager_features.h"
+ #include "components/soda/soda_util.h"
+ #include "components/webapps/isolated_web_apps/url_loading/url_loader_factory.h"
++#include "components/webapps/key_web/key_web_origin.h"
++#include "components/webapps/key_web/url_loading/key_web_url_loader_factory.h"
++#include "components/webapps/key_web/url_loading/key_web_url_rewrite.h"
+ #include "services/network/public/mojom/permissions_policy/permissions_policy_feature.mojom.h"
+ #include "third_party/blink/public/mojom/installedapp/related_application.mojom.h"
+ #endif  // !BUILDFLAG(IS_ANDROID)
+@@ -954,7 +957,22 @@
+   return url.SchemeIs(webapps::kIsolatedAppScheme);
+ }
+ #endif
++
++#if !BUILDFLAG(IS_ANDROID)
++// key-web:// content is only ever served while kKeyOriginWeb is enabled. With
++// the feature off no factory is registered, so key-web navigations fail
++// safely with ERR_UNKNOWN_URL_SCHEME.
++bool IsKeyWebServingEnabled(content::BrowserContext* browser_context) {
++  return base::FeatureList::IsEnabled(features::kKeyOriginWeb) &&
++         browser_context && !browser_context->ShutdownStarted();
++}
+ 
++bool IsKeyWebInitiator(const std::optional<url::Origin>& origin) {
++  return origin.has_value() && !origin->opaque() &&
++         origin->scheme() == key_web::kKeyWebScheme;
++}
++#endif  // !BUILDFLAG(IS_ANDROID)
++
+ // Handles the rewriting of the new tab page URL based on group policy.
+ bool HandleNewTabPageLocationOverride(
+     GURL* url,
+@@ -1856,6 +1874,24 @@
+   }
+ #endif  // BUILDFLAG(ENABLE_EXTENSIONS_CORE) && !BUILDFLAG(IS_ANDROID)
+ 
++#if !BUILDFLAG(IS_ANDROID)
++  // key-web (Spec §2.9): every key gets its own persistent StoragePartition,
++  // keyed by the kw-id only. Updates and key rotations keep the origin and
++  // therefore the data; a different key (e.g. a hijacked name) can never
++  // reach it. Never an application-isolation partition: see
++  // ShouldUrlUseApplicationIsolationLevel().
++  if (site.SchemeIs(key_web::kKeyWebScheme) &&
++      base::FeatureList::IsEnabled(features::kKeyOriginWeb)) {
++    ASSIGN_OR_RETURN(const auto key_web_origin,
++                     key_web::KeyWebOrigin::Create(site), [&](const auto&) {
++                       return default_storage_partition_config;
++                     });
++    return content::StoragePartitionConfig::Create(
++        browser_context, key_web_origin.GetPartitionDomain(),
++        /*partition_name=*/"", browser_context->IsOffTheRecord());
++  }
++#endif  // !BUILDFLAG(IS_ANDROID)
++
+   return default_storage_partition_config;
+ }
+ 
+@@ -5273,6 +5309,13 @@
+   // chrome: & friends.
+   handler->AddHandlerPair(&ChromeContentBrowserClient::HandleWebUI,
+                           &ChromeContentBrowserClient::HandleWebUIReverse);
++
++#if !BUILDFLAG(IS_ANDROID)
++  // key-web://<kw-id>/ (typed or linked) -> key-web://<kw-id>.key/, the one
++  // canonical origin for that key.
++  handler->AddHandlerPair(&key_web::RewriteBareKeyWebUrl,
++                          BrowserURLHandler::null_handler());
++#endif  // !BUILDFLAG(IS_ANDROID)
+ }
+ 
+ base::FilePath ChromeContentBrowserClient::GetDefaultDownloadDirectory() {
+@@ -6461,6 +6504,16 @@
+           /*enforce_same_origin=*/true);
+     }
+ 
++    return {};
++  }
++  if (scheme == key_web::kKeyWebScheme) {
++    // Zero install ceremony: any verified key-web bundle opens on navigation.
++    // Unlike isolated-app://, there is no install, allowlist or dev-mode
++    // check, because key-web documents get no privileges to protect.
++    if (IsKeyWebServingEnabled(browser_context)) {
++      return key_web::KeyWebURLLoaderFactory::Create(
++          browser_context, /*app_origin=*/std::nullopt, frame_tree_node_id);
++    }
+     return {};
+   }
+ #endif  // BUILDFLAG(IS_WIN) || BUILDFLAG(IS_MAC) || BUILDFLAG(IS_LINUX) ||
+@@ -6545,6 +6598,15 @@
+     factories->emplace(webapps::kIsolatedAppScheme,
+                        web_app::IsolatedWebAppURLLoaderFactory::Create(
+                            browser_context, app_origin, enforce_same_origin));
++  }
++  // key-web dedicated/shared workers: only from a key-web initiator, and only
++  // for that same key (a worker inherits the creator's origin).
++  if (IsKeyWebServingEnabled(browser_context) &&
++      IsKeyWebInitiator(request_initiator)) {
++    factories->emplace(key_web::kKeyWebScheme,
++                       key_web::KeyWebURLLoaderFactory::Create(
++                           browser_context, request_initiator,
++                           /*frame_tree_node_id=*/std::nullopt));
+   }
+ #endif  // BUILDFLAG(IS_WIN) || BUILDFLAG(IS_MAC) || BUILDFLAG(IS_LINUX) ||
+         // BUILDFLAG(IS_CHROMEOS)
+@@ -6576,6 +6638,14 @@
+                        web_app::IsolatedWebAppURLLoaderFactory::Create(
+                            browser_context, /*app_origin=*/std::nullopt,
+                            /*enforce_same_origin=*/true));
++  }
++  // key-web service worker scripts (and their updates) come from the same
++  // verified bundle; the SW scope is always the script's own key-web origin.
++  if (IsKeyWebServingEnabled(browser_context)) {
++    factories->emplace(key_web::kKeyWebScheme,
++                       key_web::KeyWebURLLoaderFactory::Create(
++                           browser_context, /*app_origin=*/std::nullopt,
++                           /*frame_tree_node_id=*/std::nullopt));
+   }
+ #endif  // BUILDFLAG(IS_WIN) || BUILDFLAG(IS_MAC) || BUILDFLAG(IS_LINUX) ||
+         // BUILDFLAG(IS_CHROMEOS)
+@@ -6860,6 +6930,18 @@
+                                browser_context, request_initiator_origin,
+                                /*enforce_same_origin=*/true));
+       }
++    }
++    // key-web subresources: registered only for key-web initiators and locked
++    // to the initiator's own key. Other origins (including other keys) can
++    // never read a key-web bundle as a subresource.
++    if (IsKeyWebServingEnabled(browser_context) &&
++        IsKeyWebInitiator(request_initiator_origin)) {
++      factories->emplace(
++          key_web::kKeyWebScheme,
++          key_web::KeyWebURLLoaderFactory::Create(
++              browser_context, request_initiator_origin,
++              frame_host ? std::optional(frame_host->GetFrameTreeNodeId())
++                         : std::nullopt));
+     }
+   }
+ #endif  // BUILDFLAG(IS_WIN) || BUILDFLAG(IS_MAC) || BUILDFLAG(IS_LINUX) ||
+diff --git a/components/BUILD.gn b/components/BUILD.gn
+--- a/components/BUILD.gn
++++ b/components/BUILD.gn
+@@ -860,6 +860,11 @@
+     deps += [ "//components/services/font_data:unit_tests" ]
+   }
+ 
++  if (is_win || is_mac || is_linux || is_chromeos) {
++    # key-web:// bundle validation and URL rewrite (KW3).
++    deps += [ "//components/webapps/key_web/url_loading:unit_tests" ]
++  }
++
+   # Private Insights (and the FCP client it links) is only used by Chrome for
+   # iOS, not tvOS.
+   if (is_ios && target_platform == "iphoneos") {
+diff --git a/components/webapps/key_web/url_loading/BUILD.gn b/components/webapps/key_web/url_loading/BUILD.gn
+new file mode 100644
+--- /dev/null
++++ b/components/webapps/key_web/url_loading/BUILD.gn
+@@ -0,0 +1,50 @@
++# Copyright 2026 The Key-Origin Web Authors
++# SPDX-License-Identifier: BSD-3-Clause
++
++assert(is_chromeos || is_win || is_mac || is_linux)
++
++# Non-network loader for key-web://<kw-id>.key/, backed by verified Signed
++# Web Bundles. Reuses SignedWebBundleReader (isolated_web_apps/reading) for
++# parsing and signature verification, and nothing else from Isolated Web Apps.
++source_set("url_loading") {
++  sources = [
++    "key_web_bundle_validation.cc",
++    "key_web_bundle_validation.h",
++    "key_web_reader_cache.cc",
++    "key_web_reader_cache.h",
++    "key_web_url_loader_factory.cc",
++    "key_web_url_loader_factory.h",
++    "key_web_url_rewrite.cc",
++    "key_web_url_rewrite.h",
++  ]
++  deps = [
++    "//base",
++    "//components/cbor",
++    "//components/web_package",
++    "//components/web_package/mojom",
++    "//components/webapps/isolated_web_apps",
++    "//components/webapps/key_web:origin",
++    "//components/webapps/key_web:scheme",
++    "//components/webapps/key_web/policy",
++    "//content/public/browser",
++    "//mojo/public/cpp/bindings",
++    "//mojo/public/cpp/system",
++    "//net",
++    "//services/network/public/cpp",
++    "//services/network/public/mojom",
++    "//third_party/blink/public/common:headers",
++    "//url",
++  ]
++  assert_no_deps = [ "//chrome/*" ]
++}
++
++source_set("unit_tests") {
++  testonly = true
++  sources = [ "key_web_url_loading_unittest.cc" ]
++  deps = [
++    ":url_loading",
++    "//components/cbor",
++    "//testing/gtest",
++    "//url",
++  ]
++}
+diff --git a/components/webapps/key_web/url_loading/key_web_bundle_validation.cc b/components/webapps/key_web/url_loading/key_web_bundle_validation.cc
+new file mode 100644
+--- /dev/null
++++ b/components/webapps/key_web/url_loading/key_web_bundle_validation.cc
+@@ -0,0 +1,103 @@
++// Copyright 2026 The Key-Origin Web Authors
++// SPDX-License-Identifier: BSD-3-Clause
++
++#include "components/webapps/key_web/url_loading/key_web_bundle_validation.h"
++
++#include <optional>
++#include <string>
++#include <variant>
++
++#include "base/strings/strcat.h"
++#include "components/cbor/reader.h"
++#include "components/cbor/values.h"
++#include "components/web_package/signed_web_bundles/signed_web_bundle_id.h"
++#include "components/web_package/signed_web_bundles/signed_web_bundle_integrity_block.h"
++#include "components/web_package/signed_web_bundles/types.h"
++#include "components/webapps/key_web/key_web_origin.h"
++
++namespace key_web {
++
++namespace {
++
++// attributes { "keyWeb": { "v": 1, "seq": n, ... } } is at most 2 levels deep
++// before the (optional) KEL; KEL events add a few more.
++constexpr size_t kMaxAttributesNesting = 8;
++constexpr uint64_t kSupportedKeyWebVersion = 1;
++
++std::optional<uint64_t> GetUnsigned(const cbor::Value::MapValue& map,
++                                    const char* key) {
++  auto it = map.find(cbor::Value(key));
++  if (it == map.end() || !it->second.is_unsigned()) {
++    return std::nullopt;
++  }
++  return static_cast<uint64_t>(it->second.GetUnsigned());
++}
++
++}  // namespace
++
++base::expected<KeyWebAttribute, std::string> ParseKeyWebAttribute(
++    base::span<const uint8_t> attributes_cbor) {
++  cbor::Reader::Config config;
++  config.max_nesting_level = kMaxAttributesNesting;
++  std::optional<cbor::Value> attributes =
++      cbor::Reader::Read(attributes_cbor, config);
++  if (!attributes || !attributes->is_map()) {
++    return base::unexpected("Integrity block attributes are not a CBOR map.");
++  }
++  const cbor::Value::MapValue& map = attributes->GetMap();
++  auto key_web = map.find(cbor::Value("keyWeb"));
++  if (key_web == map.end()) {
++    return base::unexpected(
++        "The bundle has no `keyWeb` integrity-block attribute, so its author "
++        "never targeted key-web://. Refusing to load it.");
++  }
++  if (!key_web->second.is_map()) {
++    return base::unexpected("`keyWeb` must be a CBOR map.");
++  }
++  const cbor::Value::MapValue& kw = key_web->second.GetMap();
++  std::optional<uint64_t> version = GetUnsigned(kw, "v");
++  std::optional<uint64_t> seq = GetUnsigned(kw, "seq");
++  if (!version || *version != kSupportedKeyWebVersion) {
++    return base::unexpected("`keyWeb.v` must be 1.");
++  }
++  if (!seq) {
++    return base::unexpected("`keyWeb.seq` must be an unsigned integer.");
++  }
++  return KeyWebAttribute{.version = *version, .seq = *seq};
++}
++
++base::expected<KeyWebAttribute, std::string> ValidateKeyWebIntegrityBlock(
++    const web_package::SignedWebBundleIntegrityBlock& integrity_block,
++    const KeyWebOrigin& origin) {
++  const web_package::SignedWebBundleId& expected = origin.web_bundle_id();
++  if (integrity_block.web_bundle_id() != expected) {
++    return base::unexpected(base::StrCat(
++        {"webBundleId ", integrity_block.web_bundle_id().id(),
++         " does not match the key-web origin ", expected.id()}));
++  }
++
++  bool self_certified = false;
++  for (const web_package::PublicKey& key :
++       integrity_block.signature_stack().public_keys()) {
++    const web_package::SignedWebBundleId derived = std::visit(
++        [](const auto& public_key) {
++          return web_package::SignedWebBundleId::CreateForPublicKey(
++              public_key);
++        },
++        key);
++    if (derived == expected) {
++      self_certified = true;
++      break;
++    }
++  }
++  if (!self_certified) {
++    return base::unexpected(
++        "No verified signature's public key derives to the key-web ID. "
++        "key-web identity is self-certifying; rotation data is never "
++        "consulted.");
++  }
++
++  return ParseKeyWebAttribute(integrity_block.attributes_cbor());
++}
++
++}  // namespace key_web
+diff --git a/components/webapps/key_web/url_loading/key_web_bundle_validation.h b/components/webapps/key_web/url_loading/key_web_bundle_validation.h
+new file mode 100644
+--- /dev/null
++++ b/components/webapps/key_web/url_loading/key_web_bundle_validation.h
+@@ -0,0 +1,53 @@
++// Copyright 2026 The Key-Origin Web Authors
++// SPDX-License-Identifier: BSD-3-Clause
++
++#ifndef COMPONENTS_WEBAPPS_KEY_WEB_URL_LOADING_KEY_WEB_BUNDLE_VALIDATION_H_
++#define COMPONENTS_WEBAPPS_KEY_WEB_URL_LOADING_KEY_WEB_BUNDLE_VALIDATION_H_
++
++#include <cstdint>
++#include <string>
++
++#include "base/containers/span.h"
++#include "base/types/expected.h"
++
++namespace web_package {
++class SignedWebBundleIntegrityBlock;
++}  // namespace web_package
++
++namespace key_web {
++
++class KeyWebOrigin;
++
++// The parts of the `keyWeb` integrity-block attribute this prototype checks
++// (Spec §1.5). Full KEL / HWM handling lands with the release store.
++struct KeyWebAttribute {
++  uint64_t version = 0;
++  uint64_t seq = 0;
++};
++
++// Parses the integrity block's attributes map and returns its `keyWeb` entry.
++// Fails if the attribute is missing (author-intent binding: an IWA bundle that
++// never opted into key-web is never loaded as key-web), malformed, or of an
++// unsupported version.
++//
++// NOTE: this decodes signed-but-untrusted CBOR in the browser process with
++// //components/cbor and a small nesting limit. The production design moves it
++// into the memory-safe Rust integrity-block parser (Blueprint KW2, item 1).
++base::expected<KeyWebAttribute, std::string> ParseKeyWebAttribute(
++    base::span<const uint8_t> attributes_cbor);
++
++// Runs every key-web acceptance check that does not need persistent state, on
++// an integrity block whose signatures SignedWebBundleReader already verified:
++//   1. webBundleId == the origin's kw-id;
++//   2. self-certifying identity: some VERIFIED signature's public key derives
++//      to that kw-id. This is checked here, independently of the process-wide
++//      web_package::IdentityValidator, so Isolated Web App key-rotation data
++//      (vendor-distributed trust) can never vouch for a key-web origin;
++//   3. the `keyWeb` attribute is present and well-formed.
++base::expected<KeyWebAttribute, std::string> ValidateKeyWebIntegrityBlock(
++    const web_package::SignedWebBundleIntegrityBlock& integrity_block,
++    const KeyWebOrigin& origin);
++
++}  // namespace key_web
++
++#endif  // COMPONENTS_WEBAPPS_KEY_WEB_URL_LOADING_KEY_WEB_BUNDLE_VALIDATION_H_
+diff --git a/components/webapps/key_web/url_loading/key_web_reader_cache.cc b/components/webapps/key_web/url_loading/key_web_reader_cache.cc
+new file mode 100644
+--- /dev/null
++++ b/components/webapps/key_web/url_loading/key_web_reader_cache.cc
+@@ -0,0 +1,178 @@
++// Copyright 2026 The Key-Origin Web Authors
++// SPDX-License-Identifier: BSD-3-Clause
++
++#include "components/webapps/key_web/url_loading/key_web_reader_cache.h"
++
++#include <utility>
++
++#include "base/files/file_util.h"
++#include "base/functional/bind.h"
++#include "base/location.h"
++#include "base/strings/strcat.h"
++#include "base/task/thread_pool.h"
++#include "components/webapps/key_web/url_loading/key_web_bundle_validation.h"
++#include "content/public/browser/browser_context.h"
++#include "url/origin.h"
++
++namespace key_web {
++
++namespace {
++
++const char kUserDataKey[] = "key_web::KeyWebReaderCache";
++
++std::optional<base::File::Info> GetInfoBlocking(const base::FilePath& path) {
++  base::File::Info info;
++  if (!base::GetFileInfo(path, &info) || info.is_directory) {
++    return std::nullopt;
++  }
++  return info;
++}
++
++bool SameFile(const base::File::Info& a, const base::File::Info& b) {
++  return a.size == b.size && a.last_modified == b.last_modified;
++}
++
++}  // namespace
++
++KeyWebReaderCache::Entry::Entry() = default;
++KeyWebReaderCache::Entry::Entry(Entry&&) = default;
++KeyWebReaderCache::Entry& KeyWebReaderCache::Entry::operator=(Entry&&) =
++    default;
++KeyWebReaderCache::Entry::~Entry() = default;
++
++// static
++KeyWebReaderCache& KeyWebReaderCache::GetOrCreate(
++    content::BrowserContext* context) {
++  auto* cache = static_cast<KeyWebReaderCache*>(context->GetUserData(
++      kUserDataKey));
++  if (!cache) {
++    auto owned = std::make_unique<KeyWebReaderCache>(
++        GetBundleDirectory(context));
++    cache = owned.get();
++    context->SetUserData(kUserDataKey, std::move(owned));
++  }
++  return *cache;
++}
++
++// static
++base::FilePath KeyWebReaderCache::GetBundleDirectory(
++    content::BrowserContext* context) {
++  return context->GetPath().Append(FILE_PATH_LITERAL("Key Web Bundles"));
++}
++
++KeyWebReaderCache::KeyWebReaderCache(base::FilePath bundle_directory)
++    : bundle_directory_(std::move(bundle_directory)) {}
++
++KeyWebReaderCache::~KeyWebReaderCache() = default;
++
++void KeyWebReaderCache::GetVerifiedReader(const KeyWebOrigin& origin,
++                                          ReaderCallback callback) {
++  // The file name is derived from the already-validated kw-id (base32 only),
++  // never from the request path, so it cannot escape the bundle directory.
++  const base::FilePath path = bundle_directory_.AppendASCII(
++      base::StrCat({origin.web_bundle_id().id(), ".swbn"}));
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_BLOCKING},
++      base::BindOnce(&GetInfoBlocking, path),
++      base::BindOnce(&KeyWebReaderCache::OnFileInfo,
++                     weak_factory_.GetWeakPtr(), origin, path,
++                     std::move(callback)));
++}
++
++void KeyWebReaderCache::OnFileInfo(const KeyWebOrigin& origin,
++                                   const base::FilePath& path,
++                                   ReaderCallback callback,
++                                   std::optional<base::File::Info> info) {
++  const std::string& id = origin.web_bundle_id().id();
++  if (!info) {
++    entries_.erase(id);
++    std::move(callback).Run(base::unexpected(base::StrCat(
++        {"No release of key-web://", id,
++         ".key/ is available on this device yet."})));
++    return;
++  }
++
++  auto it = entries_.find(id);
++  if (it != entries_.end() && SameFile(it->second.file_info, *info)) {
++    if (it->second.reader) {
++      std::move(callback).Run(it->second.reader->AsWeakPtr());
++      return;
++    }
++    // Verification of this exact file is already in flight.
++    it->second.pending.push_back(std::move(callback));
++    return;
++  }
++
++  // New or changed file: (re)verify from scratch. Callers waiting on an older
++  // file version are failed rather than silently handed the new one.
++  if (it != entries_.end()) {
++    Resolve(id, base::unexpected("The release changed while loading."));
++    entries_.erase(it);
++  }
++  Entry& entry = entries_[id];
++  entry.file_info = *info;
++  entry.generation = ++next_generation_;
++  entry.pending.push_back(std::move(callback));
++
++  web_app::SignedWebBundleReader::Create(
++      path, origin.GetUrl(), /*verify_signatures=*/true,
++      base::BindOnce(&KeyWebReaderCache::OnReaderCreated,
++                     weak_factory_.GetWeakPtr(), origin, entry.generation));
++}
++
++void KeyWebReaderCache::OnReaderCreated(
++    const KeyWebOrigin& origin,
++    uint64_t generation,
++    web_app::SignedWebBundleReader::Result result) {
++  const std::string& id = origin.web_bundle_id().id();
++  auto it = entries_.find(id);
++  if (it == entries_.end() || it->second.generation != generation) {
++    return;  // Superseded by a newer file; never adopt a stale verification.
++  }
++  if (!result.has_value()) {
++    Resolve(id, base::unexpected(base::StrCat(
++                    {"Invalid key-web bundle: ", result.error().message()})));
++    entries_.erase(id);
++    return;
++  }
++
++  std::unique_ptr<web_app::SignedWebBundleReader> reader =
++      std::move(result.value());
++
++  base::expected<KeyWebAttribute, std::string> attribute =
++      ValidateKeyWebIntegrityBlock(reader->GetIntegrityBlock(), origin);
++  if (!attribute.has_value()) {
++    Resolve(id, base::unexpected(attribute.error()));
++    entries_.erase(id);
++    return;
++  }
++
++  // Spec §1.5 step 7: every response must be same-origin with the key URL.
++  for (const GURL& entry_url : reader->GetEntries()) {
++    if (!origin.origin().IsSameOriginWith(entry_url)) {
++      Resolve(id, base::unexpected(base::StrCat(
++                      {"Bundle entry ", entry_url.possibly_invalid_spec(),
++                       " is not same-origin with key-web://", id, ".key"})));
++      entries_.erase(id);
++      return;
++    }
++  }
++
++  Entry& entry = entries_[id];
++  entry.reader = std::move(reader);
++  Resolve(id, entry.reader->AsWeakPtr());
++}
++
++void KeyWebReaderCache::Resolve(const std::string& id,
++                                const ReaderOrError& result) {
++  auto it = entries_.find(id);
++  if (it == entries_.end()) {
++    return;
++  }
++  std::vector<ReaderCallback> pending = std::move(it->second.pending);
++  for (ReaderCallback& callback : pending) {
++    std::move(callback).Run(result);
++  }
++}
++
++}  // namespace key_web
+diff --git a/components/webapps/key_web/url_loading/key_web_reader_cache.h b/components/webapps/key_web/url_loading/key_web_reader_cache.h
+new file mode 100644
+--- /dev/null
++++ b/components/webapps/key_web/url_loading/key_web_reader_cache.h
+@@ -0,0 +1,101 @@
++// Copyright 2026 The Key-Origin Web Authors
++// SPDX-License-Identifier: BSD-3-Clause
++
++#ifndef COMPONENTS_WEBAPPS_KEY_WEB_URL_LOADING_KEY_WEB_READER_CACHE_H_
++#define COMPONENTS_WEBAPPS_KEY_WEB_URL_LOADING_KEY_WEB_READER_CACHE_H_
++
++#include <map>
++#include <memory>
++#include <optional>
++#include <string>
++#include <vector>
++
++#include "base/files/file.h"
++#include "base/files/file_path.h"
++#include "base/functional/callback.h"
++#include "base/memory/weak_ptr.h"
++#include "base/supports_user_data.h"
++#include "base/types/expected.h"
++#include "components/webapps/isolated_web_apps/reading/signed_web_bundle_reader.h"
++#include "components/webapps/key_web/key_web_origin.h"
++
++namespace content {
++class BrowserContext;
++}  // namespace content
++
++namespace key_web {
++
++// Per-profile cache of SignedWebBundleReaders for key-web releases.
++//
++// Zero install ceremony: a release for key-web://<kw-id>.key/ is simply the
++// file `<profile>/Key Web Bundles/<kw-id>.swbn`, put there by a resolver, a
++// download or the user. Nothing is registered and no prompt is shown, because
++// nothing is trusted: every file is verified before a single byte is served.
++//
++// Verification reuses Chromium's own Signed Web Bundle stack:
++//   * web_app::SignedWebBundleReader::Create(..., verify_signatures=true)
++//     parses the integrity block out of process and verifies every signature
++//     over SHA-512 of the unsigned bundle (SignedWebBundleSignatureVerifier);
++//   * web_package::SignedWebBundleIntegrityBlock is then checked by
++//     ValidateKeyWebIntegrityBlock() (ID match, self-certifying key, keyWeb);
++//   * every entry in the bundle index must be same-origin with the key URL.
++// No IWA trust (allowlists, key distribution, dev mode) is ever consulted.
++//
++// A reader is reused until the file's size or modification time changes.
++// Monotonic release ordering (HWM / rollback protection) is out of scope for
++// this prototype and belongs to the ReleaseStore (Spec §1.6).
++class KeyWebReaderCache : public base::SupportsUserData::Data {
++ public:
++  using ReaderOrError =
++      base::expected<base::WeakPtr<web_app::SignedWebBundleReader>,
++                     std::string>;
++  using ReaderCallback = base::OnceCallback<void(ReaderOrError)>;
++
++  static KeyWebReaderCache& GetOrCreate(content::BrowserContext* context);
++
++  // `<profile>/Key Web Bundles`.
++  static base::FilePath GetBundleDirectory(content::BrowserContext* context);
++
++  explicit KeyWebReaderCache(base::FilePath bundle_directory);
++  KeyWebReaderCache(const KeyWebReaderCache&) = delete;
++  KeyWebReaderCache& operator=(const KeyWebReaderCache&) = delete;
++  ~KeyWebReaderCache() override;
++
++  void GetVerifiedReader(const KeyWebOrigin& origin, ReaderCallback callback);
++
++  // Invalidated when the BrowserContext (which owns the cache) goes away.
++  base::WeakPtr<KeyWebReaderCache> GetWeakPtr() {
++    return weak_factory_.GetWeakPtr();
++  }
++
++ private:
++  struct Entry {
++    Entry();
++    Entry(Entry&&);
++    Entry& operator=(Entry&&);
++    ~Entry();
++
++    base::File::Info file_info;
++    uint64_t generation = 0;
++    std::unique_ptr<web_app::SignedWebBundleReader> reader;
++    std::vector<ReaderCallback> pending;
++  };
++
++  void OnFileInfo(const KeyWebOrigin& origin,
++                  const base::FilePath& path,
++                  ReaderCallback callback,
++                  std::optional<base::File::Info> info);
++  void OnReaderCreated(const KeyWebOrigin& origin,
++                       uint64_t generation,
++                       web_app::SignedWebBundleReader::Result result);
++  void Resolve(const std::string& id, const ReaderOrError& result);
++
++  const base::FilePath bundle_directory_;
++  std::map<std::string, Entry> entries_;
++  uint64_t next_generation_ = 0;
++  base::WeakPtrFactory<KeyWebReaderCache> weak_factory_{this};
++};
++
++}  // namespace key_web
++
++#endif  // COMPONENTS_WEBAPPS_KEY_WEB_URL_LOADING_KEY_WEB_READER_CACHE_H_
+diff --git a/components/webapps/key_web/url_loading/key_web_url_loader_factory.cc b/components/webapps/key_web/url_loading/key_web_url_loader_factory.cc
+new file mode 100644
+--- /dev/null
++++ b/components/webapps/key_web/url_loading/key_web_url_loader_factory.cc
+@@ -0,0 +1,338 @@
++// Copyright 2026 The Key-Origin Web Authors
++// SPDX-License-Identifier: BSD-3-Clause
++
++#include "components/webapps/key_web/url_loading/key_web_url_loader_factory.h"
++
++#include <algorithm>
++#include <memory>
++#include <optional>
++#include <string>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/memory/self_deleting.h"
++#include "base/memory/weak_ptr.h"
++#include "base/strings/strcat.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/types/expected.h"
++#include "components/web_package/mojom/web_bundle_parser.mojom.h"
++#include "components/web_package/web_bundle_utils.h"
++#include "components/webapps/isolated_web_apps/reading/signed_web_bundle_reader.h"
++#include "components/webapps/key_web/key_web_origin.h"
++#include "components/webapps/key_web/policy/header_policy.h"
++#include "components/webapps/key_web/scheme.h"
++#include "components/webapps/key_web/url_loading/key_web_reader_cache.h"
++#include "content/public/browser/browser_context.h"
++#include "content/public/browser/network_service_instance.h"
++#include "content/public/browser/render_frame_host.h"
++#include "content/public/browser/web_contents.h"
++#include "mojo/public/cpp/bindings/pending_receiver.h"
++#include "mojo/public/cpp/bindings/remote.h"
++#include "mojo/public/cpp/bindings/self_owned_receiver.h"
++#include "mojo/public/cpp/system/data_pipe.h"
++#include "net/base/net_errors.h"
++#include "net/http/http_request_headers.h"
++#include "net/http/http_response_headers.h"
++#include "net/http/http_status_code.h"
++#include "services/network/public/cpp/loading_params.h"
++#include "services/network/public/cpp/resource_request.h"
++#include "services/network/public/cpp/self_deleting_url_loader_factory.h"
++#include "services/network/public/cpp/url_loader_completion_status.h"
++#include "services/network/public/mojom/network_service.mojom.h"
++#include "services/network/public/mojom/url_loader.mojom.h"
++#include "services/network/public/mojom/url_response_head.mojom.h"
++#include "third_party/blink/public/mojom/devtools/console_message.mojom-shared.h"
++
++namespace key_web {
++
++namespace {
++
++void LogToConsole(std::optional<content::FrameTreeNodeId> frame_tree_node_id,
++                  const std::string& message) {
++  if (!frame_tree_node_id) {
++    return;
++  }
++  content::WebContents* web_contents =
++      content::WebContents::FromFrameTreeNodeId(*frame_tree_node_id);
++  if (!web_contents) {
++    return;
++  }
++  web_contents->GetPrimaryMainFrame()->AddMessageToConsole(
++      blink::mojom::ConsoleMessageLevel::kError, message);
++}
++
++// Serves one request from a verified bundle. Self-owned by its receiver.
++class KeyWebURLLoader : public network::mojom::URLLoader {
++ public:
++  KeyWebURLLoader(base::WeakPtr<KeyWebReaderCache> cache,
++                  KeyWebOrigin origin,
++                  mojo::PendingRemote<network::mojom::URLLoaderClient> client,
++                  const network::ResourceRequest& request,
++                  std::optional<content::FrameTreeNodeId> frame_tree_node_id)
++      : cache_(std::move(cache)),
++        origin_(std::move(origin)),
++        client_(std::move(client)),
++        request_(request),
++        frame_tree_node_id_(frame_tree_node_id) {}
++
++  KeyWebURLLoader(const KeyWebURLLoader&) = delete;
++  KeyWebURLLoader& operator=(const KeyWebURLLoader&) = delete;
++  ~KeyWebURLLoader() override = default;
++
++  void Start() {
++    if (!cache_) {
++      Fail(net::ERR_FAILED, "key-web: profile is shutting down.");
++      return;
++    }
++    cache_->GetVerifiedReader(origin_,
++                              base::BindOnce(&KeyWebURLLoader::OnReader,
++                                             weak_factory_.GetWeakPtr()));
++  }
++
++ private:
++  void OnReader(KeyWebReaderCache::ReaderOrError reader) {
++    if (!client_.is_connected()) {
++      return;
++    }
++    if (!reader.has_value() || !reader.value()) {
++      // Never fall back to the network: an unverifiable release is simply
++      // unavailable.
++      Fail(net::ERR_INVALID_WEB_BUNDLE,
++           reader.has_value() ? "key-web: reader went away." : reader.error());
++      return;
++    }
++    reader_ = reader.value();
++    reader_->ReadResponse(request_,
++                          base::BindOnce(&KeyWebURLLoader::OnResponseRead,
++                                         weak_factory_.GetWeakPtr()));
++  }
++
++  void OnResponseRead(
++      base::expected<web_package::mojom::BundleResponsePtr,
++                     web_app::SignedWebBundleReader::ReadResponseError>
++          response) {
++    if (!client_.is_connected()) {
++      return;
++    }
++    if (!response.has_value()) {
++      if (response.error().type == web_app::SignedWebBundleReader::
++                                       ReadResponseError::Type::
++                                           kResponseNotFound) {
++        RespondGenerated(net::HTTP_NOT_FOUND);
++        return;
++      }
++      Fail(net::ERR_INVALID_WEB_BUNDLE, response.error().message);
++      return;
++    }
++    if (response.value()->response_code != net::HTTP_OK) {
++      Fail(net::ERR_INVALID_WEB_BUNDLE,
++           "key-web: bundle responses must have status 200.");
++      return;
++    }
++
++    network::mojom::URLResponseHeadPtr head =
++        web_package::CreateResourceResponseFromHeaderString(
++            web_package::CreateHeaderString(response.value()));
++    head->content_length =
++        static_cast<int64_t>(response.value()->payload_length);
++    ParseAndRespond(std::move(head), std::move(response.value()));
++  }
++
++  void RespondGenerated(net::HttpStatusCode status) {
++    network::mojom::URLResponseHeadPtr head =
++        web_package::CreateResourceResponseFromHeaderString(base::StrCat(
++            {"HTTP/1.1 ", base::NumberToString(static_cast<int>(status)), " ",
++             net::GetHttpReasonPhrase(status),
++             "\r\nContent-Type: text/plain\r\n\r\n"}));
++    head->content_length = 0;
++    ParseAndRespond(std::move(head), /*bundle_response=*/nullptr);
++  }
++
++  // Strips app headers, injects the Tier 0 policy, then has the network
++  // service parse the result (out of process; Rule of 2) so that navigations
++  // and worker scripts enforce exactly the injected policy.
++  void ParseAndRespond(network::mojom::URLResponseHeadPtr head,
++                       web_package::mojom::BundleResponsePtr bundle_response) {
++    SetRequiredHeadersForKeyWeb(*head->headers);
++    scoped_refptr<net::HttpResponseHeaders> headers = head->headers;
++    content::GetNetworkService()->ParseHeaders(
++        request_.url, std::move(headers),
++        base::BindOnce(&KeyWebURLLoader::OnHeadersParsed,
++                       weak_factory_.GetWeakPtr(), std::move(head),
++                       std::move(bundle_response)));
++  }
++
++  void OnHeadersParsed(network::mojom::URLResponseHeadPtr head,
++                       web_package::mojom::BundleResponsePtr bundle_response,
++                       network::mojom::ParsedHeadersPtr parsed_headers) {
++    if (!client_.is_connected()) {
++      return;
++    }
++    head->parsed_headers = std::move(parsed_headers);
++
++    const bool has_body = bundle_response && bundle_response->payload_length &&
++                          request_.method != net::HttpRequestHeaders::kHeadMethod;
++    body_length_ = has_body ? bundle_response->payload_length : 0;
++
++    mojo::ScopedDataPipeProducerHandle producer;
++    mojo::ScopedDataPipeConsumerHandle consumer;
++    MojoCreateDataPipeOptions options;
++    options.struct_size = sizeof(MojoCreateDataPipeOptions);
++    options.flags = MOJO_CREATE_DATA_PIPE_FLAG_NONE;
++    options.element_num_bytes = 1;
++    options.capacity_num_bytes = static_cast<uint32_t>(std::max<uint64_t>(
++        1, std::min<uint64_t>(network::GetDataPipeDefaultAllocationSize(),
++                              body_length_)));
++    if (mojo::CreateDataPipe(&options, producer, consumer) != MOJO_RESULT_OK) {
++      Fail(net::ERR_INSUFFICIENT_RESOURCES, "key-web: out of data pipes.");
++      return;
++    }
++    client_->OnReceiveResponse(std::move(head), std::move(consumer),
++                               std::nullopt);
++
++    if (!has_body) {
++      producer.reset();
++      Complete(net::OK);
++      return;
++    }
++    if (!reader_) {
++      Complete(net::ERR_FAILED);
++      return;
++    }
++    reader_->ReadResponseBody(
++        std::move(bundle_response), std::move(producer),
++        base::BindOnce(&KeyWebURLLoader::Complete,
++                       weak_factory_.GetWeakPtr()));
++  }
++
++  void Complete(net::Error error) {
++    if (!client_.is_connected()) {
++      return;
++    }
++    network::URLLoaderCompletionStatus status(error);
++    status.encoded_data_length = static_cast<int64_t>(body_length_);
++    status.encoded_body_length = static_cast<int64_t>(body_length_);
++    status.decoded_body_length = static_cast<int64_t>(body_length_);
++    client_->OnComplete(status);
++  }
++
++  void Fail(net::Error error, const std::string& message) {
++    LogToConsole(frame_tree_node_id_, message);
++    if (client_.is_connected()) {
++      client_->OnComplete(network::URLLoaderCompletionStatus(error));
++    }
++  }
++
++  // network::mojom::URLLoader:
++  void FollowRedirect(
++      network::HttpRequestHeadersUpdateParams headers_update_params,
++      const std::optional<GURL>& new_url) override {
++    // This loader never issues redirects.
++  }
++  void SetPriority(net::RequestPriority priority,
++                   int intra_priority_value) override {}
++
++  base::WeakPtr<KeyWebReaderCache> cache_;
++  const KeyWebOrigin origin_;
++  mojo::Remote<network::mojom::URLLoaderClient> client_;
++  const network::ResourceRequest request_;
++  const std::optional<content::FrameTreeNodeId> frame_tree_node_id_;
++  base::WeakPtr<web_app::SignedWebBundleReader> reader_;
++  uint64_t body_length_ = 0;
++  base::WeakPtrFactory<KeyWebURLLoader> weak_factory_{this};
++};
++
++class KeyWebURLLoaderFactoryImpl : public network::SelfDeletingURLLoaderFactory {
++ public:
++  KeyWebURLLoaderFactoryImpl(
++      base::WeakPtr<KeyWebReaderCache> cache,
++      std::optional<url::Origin> app_origin,
++      std::optional<content::FrameTreeNodeId> frame_tree_node_id,
++      mojo::PendingReceiver<network::mojom::URLLoaderFactory> receiver,
++      base::SelfDeletingPassKey key)
++      : network::SelfDeletingURLLoaderFactory(std::move(receiver), key),
++        cache_(std::move(cache)),
++        app_origin_(std::move(app_origin)),
++        frame_tree_node_id_(frame_tree_node_id) {
++    CHECK(!app_origin_ || app_origin_->scheme() == kKeyWebScheme);
++  }
++
++  KeyWebURLLoaderFactoryImpl(const KeyWebURLLoaderFactoryImpl&) = delete;
++  KeyWebURLLoaderFactoryImpl& operator=(const KeyWebURLLoaderFactoryImpl&) =
++      delete;
++
++ private:
++  ~KeyWebURLLoaderFactoryImpl() override = default;
++
++  // network::mojom::URLLoaderFactory:
++  void CreateLoaderAndStart(
++      mojo::PendingReceiver<network::mojom::URLLoader> loader_receiver,
++      int32_t request_id,
++      uint32_t options,
++      const network::ResourceRequest& request,
++      mojo::PendingRemote<network::mojom::URLLoaderClient> client,
++      const net::MutableNetworkTrafficAnnotationTag& traffic_annotation)
++      override {
++    DCHECK_CALLED_ON_VALID_THREAD(thread_checker_);
++    if (!request.url.SchemeIs(kKeyWebScheme)) {
++      ReportBadMessage("key-web factory got a non key-web URL");
++      return;
++    }
++
++    auto fail = [&](net::Error error, const std::string& message) {
++      LogToConsole(frame_tree_node_id_, message);
++      mojo::Remote<network::mojom::URLLoaderClient>(std::move(client))
++          ->OnComplete(network::URLLoaderCompletionStatus(error));
++    };
++
++    // Only <kw-id>.key hosts are origins. Name hosts must have been resolved
++    // and bare IDs rewritten before reaching a loader.
++    base::expected<KeyWebOrigin, std::string> origin =
++        KeyWebOrigin::Create(request.url);
++    if (!origin.has_value()) {
++      fail(net::ERR_INVALID_URL, origin.error());
++      return;
++    }
++    if (app_origin_ && !app_origin_->IsSameOriginWith(origin->origin())) {
++      fail(net::ERR_BLOCKED_BY_CLIENT,
++           "key-web: cross-key subresource and worker loads are refused.");
++      return;
++    }
++    if (request.method != net::HttpRequestHeaders::kGetMethod &&
++        request.method != net::HttpRequestHeaders::kHeadMethod) {
++      fail(net::ERR_METHOD_NOT_SUPPORTED,
++           "key-web: only GET and HEAD are served from bundles.");
++      return;
++    }
++
++    auto loader = std::make_unique<KeyWebURLLoader>(
++        cache_, std::move(origin.value()), std::move(client), request,
++        frame_tree_node_id_);
++    KeyWebURLLoader* raw_loader = loader.get();
++    mojo::MakeSelfOwnedReceiver(std::move(loader), std::move(loader_receiver));
++    raw_loader->Start();
++  }
++
++  const base::WeakPtr<KeyWebReaderCache> cache_;
++  const std::optional<url::Origin> app_origin_;
++  const std::optional<content::FrameTreeNodeId> frame_tree_node_id_;
++};
++
++}  // namespace
++
++// static
++mojo::PendingRemote<network::mojom::URLLoaderFactory>
++KeyWebURLLoaderFactory::Create(
++    content::BrowserContext* browser_context,
++    std::optional<url::Origin> app_origin,
++    std::optional<content::FrameTreeNodeId> frame_tree_node_id) {
++  CHECK(browser_context);
++  mojo::PendingRemote<network::mojom::URLLoaderFactory> remote;
++  base::MakeSelfDeleting<KeyWebURLLoaderFactoryImpl>(
++      KeyWebReaderCache::GetOrCreate(browser_context).GetWeakPtr(),
++      std::move(app_origin), frame_tree_node_id,
++      remote.InitWithNewPipeAndPassReceiver());
++  return remote;
++}
++
++}  // namespace key_web
+diff --git a/components/webapps/key_web/url_loading/key_web_url_loader_factory.h b/components/webapps/key_web/url_loading/key_web_url_loader_factory.h
+new file mode 100644
+--- /dev/null
++++ b/components/webapps/key_web/url_loading/key_web_url_loader_factory.h
+@@ -0,0 +1,48 @@
++// Copyright 2026 The Key-Origin Web Authors
++// SPDX-License-Identifier: BSD-3-Clause
++
++#ifndef COMPONENTS_WEBAPPS_KEY_WEB_URL_LOADING_KEY_WEB_URL_LOADER_FACTORY_H_
++#define COMPONENTS_WEBAPPS_KEY_WEB_URL_LOADING_KEY_WEB_URL_LOADER_FACTORY_H_
++
++#include <optional>
++
++#include "content/public/browser/frame_tree_node_id.h"
++#include "mojo/public/cpp/bindings/pending_remote.h"
++#include "services/network/public/mojom/url_loader_factory.mojom-forward.h"
++#include "url/origin.h"
++
++namespace content {
++class BrowserContext;
++}  // namespace content
++
++namespace key_web {
++
++// A non-network URLLoaderFactory for key-web://<kw-id>.key/.
++//
++// Every response is read from a verified Signed Web Bundle (see
++// KeyWebReaderCache); nothing ever falls back to the network. Before a
++// response reaches the renderer, app-supplied dangerous headers are stripped
++// and the Tier 0 policy (exfiltration-proof CSP, Connection-Allowlist,
++// COOP/COEP/CORP, Permissions-Policy, X-DNS-Prefetch-Control: off) is
++// injected, then the headers are re-parsed by the network service so
++// navigations and workers enforce exactly what was injected.
++//
++// Only GET and HEAD are served. Name hosts and bare IDs fail with
++// ERR_INVALID_URL (bare IDs are rewritten to `<kw-id>.key` by the embedder's
++// BrowserURLHandler before navigation). Unlike the Isolated Web App factory,
++// there is no install lookup, allowlist, or dev-mode proxy: the key is the
++// only authority.
++class KeyWebURLLoaderFactory {
++ public:
++  // `app_origin`, when set, restricts the factory to that one key-web origin
++  // (subresources, dedicated/shared workers): a compromised renderer cannot
++  // read another key's bundle through it.
++  static mojo::PendingRemote<network::mojom::URLLoaderFactory> Create(
++      content::BrowserContext* browser_context,
++      std::optional<url::Origin> app_origin,
++      std::optional<content::FrameTreeNodeId> frame_tree_node_id);
++};
++
++}  // namespace key_web
++
++#endif  // COMPONENTS_WEBAPPS_KEY_WEB_URL_LOADING_KEY_WEB_URL_LOADER_FACTORY_H_
+diff --git a/components/webapps/key_web/url_loading/key_web_url_loading_unittest.cc b/components/webapps/key_web/url_loading/key_web_url_loading_unittest.cc
+new file mode 100644
+--- /dev/null
++++ b/components/webapps/key_web/url_loading/key_web_url_loading_unittest.cc
+@@ -0,0 +1,80 @@
++// Copyright 2026 The Key-Origin Web Authors
++// SPDX-License-Identifier: BSD-3-Clause
++
++#include <optional>
++#include <vector>
++
++#include "components/cbor/values.h"
++#include "components/cbor/writer.h"
++#include "components/webapps/key_web/url_loading/key_web_bundle_validation.h"
++#include "components/webapps/key_web/url_loading/key_web_url_rewrite.h"
++#include "testing/gtest/include/gtest/gtest.h"
++#include "url/gurl.h"
++
++namespace key_web {
++namespace {
++
++constexpr char kKEdId[] =
++    "mix2p32okr3zpmwz3pily6bmbjlfrjvpyzljdkc4mzvpkb6lf2mqaaic";
++
++std::vector<uint8_t> Attributes(std::optional<cbor::Value> key_web) {
++  cbor::Value::MapValue map;
++  map.emplace(cbor::Value("webBundleId"), cbor::Value(kKEdId));
++  if (key_web) {
++    map.emplace(cbor::Value("keyWeb"), std::move(*key_web));
++  }
++  return *cbor::Writer::Write(cbor::Value(std::move(map)));
++}
++
++cbor::Value KeyWeb(int version, std::optional<int> seq) {
++  cbor::Value::MapValue kw;
++  kw.emplace(cbor::Value("v"), cbor::Value(version));
++  if (seq) {
++    kw.emplace(cbor::Value("seq"), cbor::Value(*seq));
++  }
++  kw.emplace(cbor::Value("prev"), cbor::Value());  // null
++  return cbor::Value(std::move(kw));
++}
++
++TEST(KeyWebBundleValidationTest, AcceptsKeyWebAttribute) {
++  auto attribute = ParseKeyWebAttribute(Attributes(KeyWeb(1, 7)));
++  ASSERT_TRUE(attribute.has_value()) << attribute.error();
++  EXPECT_EQ(attribute->version, 1u);
++  EXPECT_EQ(attribute->seq, 7u);
++}
++
++TEST(KeyWebBundleValidationTest, RejectsBundleWithoutKeyWebAttr) {
++  // A plain Isolated Web App bundle: its author never targeted key-web.
++  EXPECT_FALSE(ParseKeyWebAttribute(Attributes(std::nullopt)).has_value());
++}
++
++TEST(KeyWebBundleValidationTest, RejectsMalformedKeyWebAttr) {
++  EXPECT_FALSE(ParseKeyWebAttribute(Attributes(KeyWeb(2, 1))).has_value());
++  EXPECT_FALSE(
++      ParseKeyWebAttribute(Attributes(KeyWeb(1, std::nullopt))).has_value());
++  EXPECT_FALSE(
++      ParseKeyWebAttribute(Attributes(cbor::Value("yes"))).has_value());
++  const std::vector<uint8_t> garbage = {0xff, 0x00, 0x13};
++  EXPECT_FALSE(ParseKeyWebAttribute(garbage).has_value());
++}
++
++TEST(KeyWebUrlRewriteTest, BareIdBecomesKeyHost) {
++  GURL url(std::string("key-web://") + kKEdId + "/notes?x=1#y");
++  ASSERT_TRUE(RewriteBareKeyWebUrl(&url, nullptr));
++  EXPECT_EQ(url, GURL(std::string("key-web://") + kKEdId + ".key/notes?x=1#y"));
++}
++
++TEST(KeyWebUrlRewriteTest, LeavesEverythingElseAlone) {
++  for (const char* spec :
++       {"key-web://cool-site.alice.example/", "https://example.org/",
++        "key-web://not-a-key/"}) {
++    GURL url(spec);
++    EXPECT_FALSE(RewriteBareKeyWebUrl(&url, nullptr)) << spec;
++    EXPECT_EQ(url, GURL(spec));
++  }
++  GURL canonical(std::string("key-web://") + kKEdId + ".key/");
++  EXPECT_FALSE(RewriteBareKeyWebUrl(&canonical, nullptr));
++}
++
++}  // namespace
++}  // namespace key_web
+diff --git a/components/webapps/key_web/url_loading/key_web_url_rewrite.cc b/components/webapps/key_web/url_loading/key_web_url_rewrite.cc
+new file mode 100644
+--- /dev/null
++++ b/components/webapps/key_web/url_loading/key_web_url_rewrite.cc
+@@ -0,0 +1,30 @@
++// Copyright 2026 The Key-Origin Web Authors
++// SPDX-License-Identifier: BSD-3-Clause
++
++#include "components/webapps/key_web/url_loading/key_web_url_rewrite.h"
++
++#include <optional>
++#include <string>
++
++#include "components/webapps/key_web/key_web_origin.h"
++#include "components/webapps/key_web/scheme.h"
++#include "url/gurl.h"
++
++namespace key_web {
++
++bool RewriteBareKeyWebUrl(GURL* url, content::BrowserContext* context) {
++  if (!url || !url->is_valid() || !url->SchemeIs(kKeyWebScheme)) {
++    return false;
++  }
++  std::optional<std::string> host =
++      KeyWebOrigin::CanonicalHostForBareId(url->GetHost());
++  if (!host) {
++    return false;
++  }
++  GURL::Replacements replacements;
++  replacements.SetHostStr(*host);
++  *url = url->ReplaceComponents(replacements);
++  return true;
++}
++
++}  // namespace key_web
+diff --git a/components/webapps/key_web/url_loading/key_web_url_rewrite.h b/components/webapps/key_web/url_loading/key_web_url_rewrite.h
+new file mode 100644
+--- /dev/null
++++ b/components/webapps/key_web/url_loading/key_web_url_rewrite.h
+@@ -0,0 +1,24 @@
++// Copyright 2026 The Key-Origin Web Authors
++// SPDX-License-Identifier: BSD-3-Clause
++
++#ifndef COMPONENTS_WEBAPPS_KEY_WEB_URL_LOADING_KEY_WEB_URL_REWRITE_H_
++#define COMPONENTS_WEBAPPS_KEY_WEB_URL_LOADING_KEY_WEB_URL_REWRITE_H_
++
++class GURL;
++
++namespace content {
++class BrowserContext;
++}  // namespace content
++
++namespace key_web {
++
++// content::BrowserURLHandler::URLHandler. Rewrites typed / linked input of the
++// form key-web://<ed25519-or-p256-kw-id>/<path> to the single canonical origin
++// key-web://<kw-id>.key/<path> (Spec §1.3 rule 4), so one key never maps to
++// two origins. Returns false (and leaves `url` untouched) for everything
++// else, including name hosts.
++bool RewriteBareKeyWebUrl(GURL* url, content::BrowserContext* context);
++
++}  // namespace key_web
++
++#endif  // COMPONENTS_WEBAPPS_KEY_WEB_URL_LOADING_KEY_WEB_URL_REWRITE_H_

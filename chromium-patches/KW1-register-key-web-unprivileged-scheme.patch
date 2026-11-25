@@ -1,0 +1,647 @@
+Subject: [PATCH KW1/3] key-web: register the unprivileged key-web:// scheme
+
+SPDX-License-Identifier: BSD-3-Clause
+Copyright 2026 The Key-Origin Web Authors
+Target: Chromium 160.0.8176.0 (apply with: patch -p1 -d src < this.patch)
+
+Registers key-web:// as a standard, secure, CORS-enabled, service-worker and
+web-storage scheme, and makes it structurally impossible for it to become an
+isolated context:
+
+  * chrome/common/chrome_content_client.cc
+      Adds key-web to kChromeStandardURLSchemes plus the secure, CORS, SW and
+      web-storage lists. It is NOT added to isolated_app_schemes or
+      csp_bypassing_schemes, and it IS added to the new
+      never_isolated_context_schemes list.
+  * content/public/common/content_client.h, content/common/url_schemes.cc
+      New Schemes::never_isolated_context_schemes. RegisterContentSchemes()
+      CHECKs that every entry is standard + secure and absent from
+      isolated_app / csp_bypassing / extension / local / no_access /
+      code_cache lists, and that it never reaches
+      blink::CommonSchemeRegistry::RegisterURLSchemeAsIsolatedApp(). Because
+      Blink only reports IsIsolatedContext() for schemes registered there,
+      key-web documents always see IsIsolatedContext() == false.
+  * chrome/browser/chrome_content_browser_client.cc
+      ShouldUrlUseApplicationIsolationLevel() returns false for key-web (and
+      blob:/filesystem: URLs whose inner origin is key-web) before any IWA
+      logic runs, so key-web can reach kIsolated (COOP+COEP) but never
+      kIsolatedApplication.
+  * components/webapps/key_web/{scheme.h,key_web_origin.*}
+      kKeyWebScheme and KeyWebOrigin: key-web://<kw-id>.key only. Name hosts
+      (cool-site.alice.example), bare IDs, ports, userinfo and proxy-mode IDs
+      are rejected. Partition domain = "k" + b64(SHA-256(ctx || origin)).
+  * chrome/common/chrome_features.*: kKeyOriginWeb (disabled by default).
+      Scheme registration precedes the FeatureList, so the feature gates the
+      loader factory (KW3), not the scheme.
+
+There is no //url in the 160.0.8176.0 reference checkout, and Chromium keeps
+embedder schemes out of url/url_constants.h (isolated-app lives in
+components/webapps/isolated_web_apps/scheme.h). kKeyWebScheme follows that
+precedent in components/webapps/key_web/scheme.h.
+
+Tests: components_unittests --gtest_filter='KeyWebOriginTest.*'
+
+diff --git a/chrome/browser/BUILD.gn b/chrome/browser/BUILD.gn
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -1640,6 +1640,7 @@
+       "//components/soda:constants",
+       "//components/soda:utils",
+       "//components/webapps/isolated_web_apps",
++      "//components/webapps/key_web:scheme",
+     ]
+   }
+ 
+diff --git a/chrome/browser/chrome_content_browser_client.cc b/chrome/browser/chrome_content_browser_client.cc
+--- a/chrome/browser/chrome_content_browser_client.cc
++++ b/chrome/browser/chrome_content_browser_client.cc
+@@ -664,6 +664,7 @@
+ #if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_MAC) || BUILDFLAG(IS_LINUX) || \
+     BUILDFLAG(IS_CHROMEOS)
+ #include "components/webapps/isolated_web_apps/scheme.h"
++#include "components/webapps/key_web/scheme.h"
+ #endif  // BUILDFLAG(IS_WIN) || BUILDFLAG(IS_MAC) || BUILDFLAG(IS_LINUX) ||
+         // BUILDFLAG(IS_CHROMEOS)
+ 
+@@ -2813,6 +2814,19 @@
+ bool ChromeContentBrowserClient::ShouldUrlUseApplicationIsolationLevel(
+     content::BrowserContext* browser_context,
+     const GURL& url) {
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_MAC) || BUILDFLAG(IS_LINUX) || \
++    BUILDFLAG(IS_CHROMEOS)
++  // key-web documents may become cross-origin isolated (COOP+COEP), but must
++  // never reach the application isolation level: that level is what makes
++  // IsIsolatedContext() true and exposes Direct Sockets, Controlled Frame and
++  // every other [IsolatedContext] API. Decide this before any IWA logic so a
++  // future refactor of the IWA branch cannot flip it. blob:/filesystem: inner
++  // origins resolve to the key-web origin through url::Origin::Create().
++  if (url::Origin::Create(url).scheme() == key_web::kKeyWebScheme) {
++    return false;
++  }
++#endif  // BUILDFLAG(IS_WIN) || BUILDFLAG(IS_MAC) || BUILDFLAG(IS_LINUX) ||
++        // BUILDFLAG(IS_CHROMEOS)
+ #if BUILDFLAG(ENABLE_EXTENSIONS_CORE) && !BUILDFLAG(IS_ANDROID)
+   if (!content::AreIsolatedWebAppsEnabled(browser_context)) {
+     return false;
+diff --git a/chrome/common/BUILD.gn b/chrome/common/BUILD.gn
+--- a/chrome/common/BUILD.gn
++++ b/chrome/common/BUILD.gn
+@@ -277,7 +277,10 @@
+   ]
+ 
+   if (is_mac || is_win || is_linux || is_chromeos) {
+-    deps += [ "//components/webapps/isolated_web_apps:scheme" ]
++    deps += [
++      "//components/webapps/isolated_web_apps:scheme",
++      "//components/webapps/key_web:scheme",
++    ]
+   }
+ 
+   if (is_android || enable_library_cdms || enable_playready) {
+diff --git a/chrome/common/chrome_content_client.cc b/chrome/common/chrome_content_client.cc
+--- a/chrome/common/chrome_content_client.cc
++++ b/chrome/common/chrome_content_client.cc
+@@ -63,6 +63,7 @@
+ #if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_MAC) || BUILDFLAG(IS_LINUX) || \
+     BUILDFLAG(IS_CHROMEOS)
+ #include "components/webapps/isolated_web_apps/scheme.h"
++#include "components/webapps/key_web/scheme.h"
+ #endif  // BUILDFLAG(IS_WIN) || BUILDFLAG(IS_MAC) || BUILDFLAG(IS_LINUX) ||
+         // BUILDFLAG(IS_CHROMEOS)
+ 
+@@ -193,6 +194,9 @@
+ #if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_MAC) || BUILDFLAG(IS_LINUX) || \
+     BUILDFLAG(IS_CHROMEOS)
+     webapps::kIsolatedAppScheme,
++    // Unprivileged key-origin web apps. Standard so that every key is its own
++    // tuple origin (and site); see AddAdditionalSchemes() for what it is NOT.
++    key_web::kKeyWebScheme,
+ #endif  // BUILDFLAG(IS_WIN) || BUILDFLAG(IS_MAC) || BUILDFLAG(IS_LINUX) ||
+         // BUILDFLAG(IS_CHROMEOS)
+     chrome::kChromeNativeScheme,        chrome::kChromeSearchScheme,
+@@ -271,6 +275,22 @@
+   schemes->cors_enabled_schemes.push_back(webapps::kIsolatedAppScheme);
+   schemes->service_worker_schemes.push_back(webapps::kIsolatedAppScheme);
+   url::AddWebStorageScheme(webapps::kIsolatedAppScheme);
++
++  // key-web: secure (crypto.subtle, OPFS, service workers), CORS-enabled for
++  // same-origin fetch(), and web-storage capable.
++  //
++  // DELIBERATELY NOT registered in:
++  //   * isolated_app_schemes:  key-web documents must never be isolated
++  //     contexts (IsIsolatedContext() == false), so no [IsolatedContext] API
++  //     (Direct Sockets, Controlled Frame, ...) is ever exposed to them;
++  //   * csp_bypassing_schemes: key-web resources stay subject to CSP;
++  //   * code_cache_schemes / extension_schemes / local_schemes.
++  // never_isolated_context_schemes makes RegisterContentSchemes() CHECK this.
++  schemes->secure_schemes.push_back(key_web::kKeyWebScheme);
++  schemes->cors_enabled_schemes.push_back(key_web::kKeyWebScheme);
++  schemes->service_worker_schemes.push_back(key_web::kKeyWebScheme);
++  schemes->never_isolated_context_schemes.push_back(key_web::kKeyWebScheme);
++  url::AddWebStorageScheme(key_web::kKeyWebScheme);
+ #endif  // BUILDFLAG(IS_WIN) || BUILDFLAG(IS_MAC) || BUILDFLAG(IS_LINUX) ||
+         // BUILDFLAG(IS_CHROMEOS)
+ 
+diff --git a/chrome/common/chrome_features.cc b/chrome/common/chrome_features.cc
+--- a/chrome/common/chrome_features.cc
++++ b/chrome/common/chrome_features.cc
+@@ -1396,6 +1396,15 @@
+ BASE_FEATURE(kIsolatedWebAppBundleCache, base::FEATURE_ENABLED_BY_DEFAULT);
+ #endif  // BUILDFLAG(IS_CHROMEOS)
+ 
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_MAC) || BUILDFLAG(IS_LINUX) || \
++    BUILDFLAG(IS_CHROMEOS)
++// Enables unprivileged key-origin web apps (key-web://<kw-id>.key/). The
++// scheme itself is registered unconditionally (scheme registration runs before
++// the FeatureList exists); this feature gates the loader factory, so with it
++// disabled no key-web navigation can ever load content.
++BASE_FEATURE(kKeyOriginWeb, base::FEATURE_DISABLED_BY_DEFAULT);
++#endif
++
+ #if BUILDFLAG(IS_LINUX) && !BUILDFLAG(IS_CHROMEOS)
+ BASE_FEATURE(kLinuxLowMemoryMonitor, base::FEATURE_DISABLED_BY_DEFAULT);
+ // Values taken from the low-memory-monitor documentation and also apply to the
+diff --git a/chrome/common/chrome_features.h b/chrome/common/chrome_features.h
+--- a/chrome/common/chrome_features.h
++++ b/chrome/common/chrome_features.h
+@@ -968,6 +968,11 @@
+ BASE_DECLARE_FEATURE(kIsolatedWebAppBundleCache);
+ #endif
+ 
++#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_MAC) || BUILDFLAG(IS_LINUX) || \
++    BUILDFLAG(IS_CHROMEOS)
++COMPONENT_EXPORT(CHROME_FEATURES) BASE_DECLARE_FEATURE(kKeyOriginWeb);
++#endif
++
+ #if BUILDFLAG(IS_LINUX) && !BUILDFLAG(IS_CHROMEOS)
+ COMPONENT_EXPORT(CHROME_FEATURES) BASE_DECLARE_FEATURE(kLinuxLowMemoryMonitor);
+ COMPONENT_EXPORT(CHROME_FEATURES)
+diff --git a/components/BUILD.gn b/components/BUILD.gn
+--- a/components/BUILD.gn
++++ b/components/BUILD.gn
+@@ -846,6 +846,7 @@
+       "//components/private_insights:unit_tests",
+       "//components/stability_report:unit_tests",
+       "//components/webapps/isolated_web_apps:unit_tests",
++      "//components/webapps/key_web:unit_tests",
+     ]
+   }
+ 
+diff --git a/components/webapps/key_web/BUILD.gn b/components/webapps/key_web/BUILD.gn
+new file mode 100644
+--- /dev/null
++++ b/components/webapps/key_web/BUILD.gn
+@@ -0,0 +1,44 @@
++# Copyright 2026 The Key-Origin Web Authors
++# SPDX-License-Identifier: BSD-3-Clause
++
++assert(is_chromeos || is_win || is_mac || is_linux,
++       "components/webapps/key_web is desktop-only, like isolated_web_apps.")
++
++# The scheme constant only. Safe to depend on from //chrome/common and from
++# any process; it carries no privileges of its own.
++source_set("scheme") {
++  sources = [ "scheme.h" ]
++  assert_no_deps = [ "//chrome/*" ]
++}
++
++# key-web://<kw-id>.key origins. Browser-agnostic.
++source_set("origin") {
++  sources = [
++    "key_web_origin.cc",
++    "key_web_origin.h",
++  ]
++  deps = [ "//crypto" ]
++  public_deps = [
++    ":scheme",
++    "//base",
++    "//components/web_package",
++    "//url",
++  ]
++  assert_no_deps = [
++    "//chrome/*",
++    "//components/webapps/isolated_web_apps/*",
++  ]
++}
++
++source_set("unit_tests") {
++  testonly = true
++  sources = [ "key_web_origin_unittest.cc" ]
++  deps = [
++    ":origin",
++    ":scheme",
++    "//base/test:test_support",
++    "//components/web_package",
++    "//testing/gtest",
++    "//url",
++  ]
++}
+diff --git a/components/webapps/key_web/DEPS b/components/webapps/key_web/DEPS
+new file mode 100644
+--- /dev/null
++++ b/components/webapps/key_web/DEPS
+@@ -0,0 +1,14 @@
++# key-web must never borrow Isolated Web App trust: no isolated_web_apps
++# includes outside of reading/ (reused only for SignedWebBundleReader).
++include_rules = [
++  "+components/web_package",
++  "+components/webapps/isolated_web_apps/reading",
++  "+content/public/browser",
++  "+content/public/common",
++  "+crypto",
++  "+mojo/public/cpp",
++  "+net",
++  "+services/network/public",
++  "+third_party/blink/public/mojom",
++  "+url",
++]
+diff --git a/components/webapps/key_web/key_web_origin.cc b/components/webapps/key_web/key_web_origin.cc
+new file mode 100644
+--- /dev/null
++++ b/components/webapps/key_web/key_web_origin.cc
+@@ -0,0 +1,127 @@
++// Copyright 2026 The Key-Origin Web Authors
++// SPDX-License-Identifier: BSD-3-Clause
++
++#include "components/webapps/key_web/key_web_origin.h"
++
++#include <string>
++#include <string_view>
++
++#include "base/base64.h"
++#include "base/strings/strcat.h"
++#include "base/strings/string_util.h"
++#include "base/types/expected.h"
++#include "base/types/expected_macros.h"
++#include "components/web_package/signed_web_bundles/signed_web_bundle_id.h"
++#include "components/webapps/key_web/scheme.h"
++#include "crypto/hash.h"
++
++namespace key_web {
++
++namespace {
++
++constexpr char kPartitionHashContext[] = "key-web-partition/v1";
++constexpr size_t kKeyHostSuffixLength = sizeof(kKeyHostSuffix) - 1;
++
++base::expected<web_package::SignedWebBundleId, std::string> ParseKwId(
++    std::string_view id) {
++  ASSIGN_OR_RETURN(auto web_bundle_id,
++                   web_package::SignedWebBundleId::Create(id));
++  switch (web_bundle_id.type()) {
++    case web_package::SignedWebBundleId::Type::kEd25519PublicKey:
++    case web_package::SignedWebBundleId::Type::kEcdsaP256PublicKey:
++      return web_bundle_id;
++    case web_package::SignedWebBundleId::Type::kProxyMode:
++      return base::unexpected(
++          "Proxy-mode (development) IDs are never valid key-web IDs.");
++  }
++}
++
++}  // namespace
++
++KeyWebOrigin::KeyWebOrigin(const web_package::SignedWebBundleId& web_bundle_id)
++    : origin_(url::Origin::CreateFromNormalizedTuple(
++          kKeyWebScheme,
++          base::StrCat({web_bundle_id.id(), kKeyHostSuffix}),
++          /*port=*/0)),
++      web_bundle_id_(web_bundle_id) {
++  CHECK(!web_bundle_id.is_for_proxy_mode());
++}
++
++KeyWebOrigin::KeyWebOrigin(const KeyWebOrigin&) = default;
++KeyWebOrigin& KeyWebOrigin::operator=(const KeyWebOrigin&) = default;
++KeyWebOrigin::~KeyWebOrigin() = default;
++
++// static
++base::expected<KeyWebOrigin, std::string> KeyWebOrigin::Create(
++    const GURL& url) {
++  if (!url.is_valid()) {
++    return base::unexpected("Invalid URL");
++  }
++  if (!url.SchemeIs(kKeyWebScheme)) {
++    return base::unexpected(base::StrCat(
++        {"The URL scheme must be ", kKeyWebScheme, ", but was ",
++         url.GetScheme()}));
++  }
++  // `key-web` is registered as url::SCHEME_WITH_HOST, so a canonical GURL can
++  // never carry these. Re-check anyway: an origin must be (scheme, host, 0).
++  if (url.has_username() || url.has_password() || url.has_port()) {
++    return base::unexpected("key-web URLs must not carry userinfo or a port.");
++  }
++  return CreateFromHost(url.GetHost());
++}
++
++// static
++base::expected<KeyWebOrigin, std::string> KeyWebOrigin::CreateFromHost(
++    std::string_view host) {
++  if (!IsKeyHost(host)) {
++    return base::unexpected(base::StrCat(
++        {"The host of a key-web origin must be <kw-id>.key (got ", host,
++         "). Name hosts are resolved and redirected, never committed."}));
++  }
++  std::string_view id = host.substr(0, host.size() - kKeyHostSuffixLength);
++  return ParseKwId(id).transform(
++      [](const web_package::SignedWebBundleId& web_bundle_id) {
++        return KeyWebOrigin(web_bundle_id);
++      });
++}
++
++// static
++std::optional<std::string> KeyWebOrigin::CanonicalHostForBareId(
++    std::string_view host) {
++  if (host.find('.') != std::string_view::npos) {
++    return std::nullopt;
++  }
++  if (!ParseKwId(host).has_value()) {
++    return std::nullopt;
++  }
++  return base::StrCat({host, kKeyHostSuffix});
++}
++
++GURL KeyWebOrigin::GetUrl() const {
++  return origin_.GetURL();
++}
++
++std::string KeyWebOrigin::GetPartitionDomain() const {
++  return "k" + base::Base64Encode(crypto::hash::Sha256(
++                   base::StrCat({kPartitionHashContext, origin_.Serialize()})));
++}
++
++bool IsKeyHost(std::string_view host) {
++  if (!base::EndsWith(host, kKeyHostSuffix)) {
++    return false;
++  }
++  std::string_view id = host.substr(0, host.size() - kKeyHostSuffixLength);
++  // Exactly one label before ".key": 56 (Ed25519) or 58 (P-256) characters of
++  // the lowercase RFC 4648 base32 alphabet.
++  if (id.size() != 56 && id.size() != 58) {
++    return false;
++  }
++  for (char c : id) {
++    if (!((c >= 'a' && c <= 'z') || (c >= '2' && c <= '7'))) {
++      return false;
++    }
++  }
++  return true;
++}
++
++}  // namespace key_web
+diff --git a/components/webapps/key_web/key_web_origin.h b/components/webapps/key_web/key_web_origin.h
+new file mode 100644
+--- /dev/null
++++ b/components/webapps/key_web/key_web_origin.h
+@@ -0,0 +1,70 @@
++// Copyright 2026 The Key-Origin Web Authors
++// SPDX-License-Identifier: BSD-3-Clause
++
++#ifndef COMPONENTS_WEBAPPS_KEY_WEB_KEY_WEB_ORIGIN_H_
++#define COMPONENTS_WEBAPPS_KEY_WEB_KEY_WEB_ORIGIN_H_
++
++#include <optional>
++#include <string>
++#include <string_view>
++
++#include "base/types/expected.h"
++#include "components/web_package/signed_web_bundles/signed_web_bundle_id.h"
++#include "url/gurl.h"
++#include "url/origin.h"
++
++namespace key_web {
++
++// The origin of an unprivileged key-web app: key-web://<kw-id>.key
++//
++// Mirrors web_app::IwaOrigin, with three deliberate differences:
++//   * the host is `<kw-id>.key`, never the bare ID, so a human-readable name
++//     host (`cool-site.alice.example`) can never be parsed into an origin;
++//   * proxy-mode (development) IDs are rejected;
++//   * the storage partition domain uses the "k" prefix and its own hash
++//     context, so it can never collide with an IWA partition.
++class KeyWebOrigin {
++ public:
++  explicit KeyWebOrigin(const web_package::SignedWebBundleId& web_bundle_id);
++
++  // Parses a canonical key URL. Rejects non-key-web schemes, ports,
++  // userinfo, name hosts, bare IDs, and proxy-mode IDs.
++  static base::expected<KeyWebOrigin, std::string> Create(const GURL& url);
++
++  // Parses a host of the form `<kw-id>.key`.
++  static base::expected<KeyWebOrigin, std::string> CreateFromHost(
++      std::string_view host);
++
++  // If `host` is a bare kw-id (typed input such as key-web://<kw-id>/), returns
++  // the canonical `<kw-id>.key` host. Returns nullopt for everything else.
++  static std::optional<std::string> CanonicalHostForBareId(
++      std::string_view host);
++
++  KeyWebOrigin(const KeyWebOrigin&);
++  KeyWebOrigin& operator=(const KeyWebOrigin&);
++  ~KeyWebOrigin();
++
++  const url::Origin& origin() const { return origin_; }
++  const web_package::SignedWebBundleId& web_bundle_id() const {
++    return web_bundle_id_;
++  }
++
++  // key-web://<kw-id>.key/
++  GURL GetUrl() const;
++
++  // "k" + Base64(SHA-256("key-web-partition/v1" + origin.Serialize())).
++  std::string GetPartitionDomain() const;
++
++  auto operator<=>(const KeyWebOrigin&) const = default;
++
++ private:
++  url::Origin origin_;
++  web_package::SignedWebBundleId web_bundle_id_;
++};
++
++// True for `<kw-id>.key` hosts and for nothing else. Never parses names.
++bool IsKeyHost(std::string_view host);
++
++}  // namespace key_web
++
++#endif  // COMPONENTS_WEBAPPS_KEY_WEB_KEY_WEB_ORIGIN_H_
+diff --git a/components/webapps/key_web/key_web_origin_unittest.cc b/components/webapps/key_web/key_web_origin_unittest.cc
+new file mode 100644
+--- /dev/null
++++ b/components/webapps/key_web/key_web_origin_unittest.cc
+@@ -0,0 +1,93 @@
++// Copyright 2026 The Key-Origin Web Authors
++// SPDX-License-Identifier: BSD-3-Clause
++
++#include "components/webapps/key_web/key_web_origin.h"
++
++#include "components/web_package/signed_web_bundles/signed_web_bundle_id.h"
++#include "components/webapps/key_web/scheme.h"
++#include "testing/gtest/include/gtest/gtest.h"
++#include "url/gurl.h"
++
++namespace key_web {
++namespace {
++
++// Worked example from the architecture spec (§1.2). Not a real key: the
++// payload is SHA-256 of a fixed public string, with the Ed25519 suffix.
++constexpr char kKEdId[] =
++    "mix2p32okr3zpmwz3pily6bmbjlfrjvpyzljdkc4mzvpkb6lf2mqaaic";
++
++GURL KeyUrl(std::string_view tail = "/") {
++  return GURL(std::string("key-web://") + kKEdId + ".key" + std::string(tail));
++}
++
++TEST(KeyWebOriginTest, ParsesKEd) {
++  auto origin = KeyWebOrigin::Create(KeyUrl("/index.html"));
++  ASSERT_TRUE(origin.has_value()) << origin.error();
++  EXPECT_EQ(origin->web_bundle_id().type(),
++            web_package::SignedWebBundleId::Type::kEd25519PublicKey);
++  EXPECT_EQ(origin->origin().Serialize(),
++            std::string("key-web://") + kKEdId + ".key");
++  EXPECT_EQ(origin->GetUrl(), KeyUrl());
++}
++
++TEST(KeyWebOriginTest, IsTupleOriginNotOpaque) {
++  auto origin = KeyWebOrigin::Create(KeyUrl());
++  ASSERT_TRUE(origin.has_value());
++  EXPECT_FALSE(origin->origin().opaque());
++  EXPECT_EQ(origin->origin().scheme(), kKeyWebScheme);
++}
++
++TEST(KeyWebOriginTest, RejectsNameHost) {
++  EXPECT_FALSE(
++      KeyWebOrigin::Create(GURL("key-web://cool-site.alice.example/")).has_value());
++  EXPECT_FALSE(
++      KeyWebOrigin::Create(GURL("key-web://cool-site.alice.dht/")).has_value());
++  EXPECT_FALSE(KeyWebOrigin::Create(GURL("key-web://notes.mom.local/")).has_value());
++}
++
++TEST(KeyWebOriginTest, RequiresDotKeySuffix) {
++  // A bare ID is typed input only; it is rewritten, never an origin.
++  EXPECT_FALSE(KeyWebOrigin::Create(GURL(std::string("key-web://") + kKEdId + "/"))
++                   .has_value());
++  EXPECT_EQ(KeyWebOrigin::CanonicalHostForBareId(kKEdId),
++            std::string(kKEdId) + ".key");
++  EXPECT_FALSE(KeyWebOrigin::CanonicalHostForBareId("cool-site.alice.example"));
++}
++
++TEST(KeyWebOriginTest, RejectsOtherSchemes) {
++  EXPECT_FALSE(KeyWebOrigin::Create(GURL(std::string("isolated-app://") +
++                                         kKEdId + "/"))
++                   .has_value());
++  EXPECT_FALSE(
++      KeyWebOrigin::Create(GURL(std::string("https://") + kKEdId + ".key/"))
++          .has_value());
++}
++
++TEST(KeyWebOriginTest, RejectsProxyMode) {
++  auto proxy_id = web_package::SignedWebBundleId::CreateRandomForProxyMode();
++  EXPECT_FALSE(
++      KeyWebOrigin::CreateFromHost(proxy_id.id() + ".key").has_value());
++}
++
++TEST(KeyWebOriginTest, LowercasesHost) {
++  std::string upper = std::string("key-web://") + kKEdId + ".KEY/";
++  for (char& c : upper) {
++    c = static_cast<char>(toupper(c));
++  }
++  auto origin = KeyWebOrigin::Create(GURL(upper));
++  ASSERT_TRUE(origin.has_value()) << origin.error();
++  EXPECT_EQ(origin->origin().host(), std::string(kKEdId) + ".key");
++}
++
++TEST(KeyWebOriginTest, PartitionDomainIsKeyScoped) {
++  auto origin = KeyWebOrigin::Create(KeyUrl());
++  ASSERT_TRUE(origin.has_value());
++  const std::string domain = origin->GetPartitionDomain();
++  ASSERT_FALSE(domain.empty());
++  EXPECT_EQ(domain[0], 'k');
++  // Stable across paths of the same origin.
++  EXPECT_EQ(domain, KeyWebOrigin::Create(KeyUrl("/a/b?c"))->GetPartitionDomain());
++}
++
++}  // namespace
++}  // namespace key_web
+diff --git a/components/webapps/key_web/scheme.h b/components/webapps/key_web/scheme.h
+new file mode 100644
+--- /dev/null
++++ b/components/webapps/key_web/scheme.h
+@@ -0,0 +1,25 @@
++// Copyright 2026 The Key-Origin Web Authors
++// SPDX-License-Identifier: BSD-3-Clause
++
++#ifndef COMPONENTS_WEBAPPS_KEY_WEB_SCHEME_H_
++#define COMPONENTS_WEBAPPS_KEY_WEB_SCHEME_H_
++
++namespace key_web {
++
++// The key-web: scheme hosts unprivileged, signed web bundles whose origin is
++// derived from a public key: key-web://<kw-id>.key/.
++//
++// It is registered as standard, secure, CORS-enabled, service-worker and
++// web-storage capable. It is deliberately NOT registered as an isolated-app
++// scheme or a CSP-bypassing scheme: key-web documents must never be isolated
++// contexts and must never be granted Isolated Web App privileges.
++inline constexpr char kKeyWebScheme[] = "key-web";
++inline constexpr char16_t kKeyWebSchemeUtf16[] = u"key-web";
++
++// Canonical key URLs carry the key in the first host label, followed by this
++// reserved suffix. Only `<kw-id>.key` hosts can ever become an origin.
++inline constexpr char kKeyHostSuffix[] = ".key";
++
++}  // namespace key_web
++
++#endif  // COMPONENTS_WEBAPPS_KEY_WEB_SCHEME_H_
+diff --git a/content/common/url_schemes.cc b/content/common/url_schemes.cc
+--- a/content/common/url_schemes.cc
++++ b/content/common/url_schemes.cc
+@@ -59,6 +59,22 @@
+   ContentClient::Schemes schemes;
+   GetContentClient()->AddAdditionalSchemes(&schemes);
+ 
++  // Unprivileged schemes (e.g. key-web) must never be promoted to isolated
++  // contexts or exempted from CSP, no matter which embedder list they leak
++  // into. Fail at startup rather than ship a privilege escalation.
++  for (const auto& scheme : schemes.never_isolated_context_schemes) {
++    CHECK(std::ranges::contains(schemes.standard_schemes, scheme)) << scheme;
++    CHECK(std::ranges::contains(schemes.secure_schemes, scheme)) << scheme;
++    CHECK(!std::ranges::contains(schemes.isolated_app_schemes, scheme))
++        << scheme;
++    CHECK(!std::ranges::contains(schemes.csp_bypassing_schemes, scheme))
++        << scheme;
++    CHECK(!std::ranges::contains(schemes.extension_schemes, scheme)) << scheme;
++    CHECK(!std::ranges::contains(schemes.local_schemes, scheme)) << scheme;
++    CHECK(!std::ranges::contains(schemes.no_access_schemes, scheme)) << scheme;
++    CHECK(!std::ranges::contains(schemes.code_cache_schemes, scheme)) << scheme;
++  }
++
+   url::AddStandardScheme(kChromeDevToolsScheme, url::SCHEME_WITH_HOST);
+   url::AddStandardScheme(kChromeUIScheme, url::SCHEME_WITH_HOST);
+   url::AddStandardScheme(kChromeUIUntrustedScheme, url::SCHEME_WITH_HOST);
+@@ -83,6 +99,11 @@
+     blink::CommonSchemeRegistry::RegisterURLSchemeAsExtension(scheme.c_str());
+ 
+   for (auto& scheme : schemes.isolated_app_schemes) {
++    // Defense in depth for the CHECKs above: never_isolated_context_schemes
++    // must not reach Blink's isolated-app registry.
++    CHECK(!std::ranges::contains(schemes.never_isolated_context_schemes,
++                                 scheme))
++        << scheme;
+     blink::CommonSchemeRegistry::RegisterURLSchemeAsIsolatedApp(scheme.c_str());
+   }
+ 
+diff --git a/content/public/common/content_client.h b/content/public/common/content_client.h
+--- a/content/public/common/content_client.h
++++ b/content/public/common/content_client.h
+@@ -149,6 +149,13 @@
+     std::vector<std::pair<std::string, std::string>> predefined_handler_schemes;
+     // Registers a URL scheme as an Isolated Web App scheme.
+     std::vector<std::string> isolated_app_schemes;
++    // Schemes that host untrusted, unprivileged content and therefore must
++    // NEVER qualify as isolated contexts, even though they are standard and
++    // secure. RegisterContentSchemes() CHECKs that every entry is standard and
++    // secure, and is absent from isolated_app_schemes, csp_bypassing_schemes,
++    // extension_schemes, local_schemes, no_access_schemes and
++    // code_cache_schemes. Used for key-web.
++    std::vector<std::string> never_isolated_context_schemes;
+     // Registers a URL scheme whose scripts may use the V8 code cache. It must
+     // also be in standard_schemes; http, https, chrome and chrome-untrusted are
+     // not allowed. Entries are keyed by the requesting process's lock like

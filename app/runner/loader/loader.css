@@ -1,0 +1,47 @@
+/* Copyright (c) 2026 KeyWeb Runner authors. BSD-3-Clause (see LICENSE). */
+
+:root {
+  color-scheme: dark light;
+  --bg: #0f1115;
+  --text: #e6e8ee;
+  --muted: #9aa3b5;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f6f7f9;
+    --text: #1b1f27;
+    --muted: #5b6474;
+  }
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  display: grid;
+  place-items: center;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+.loader {
+  max-width: 44ch;
+  padding: 24px;
+  text-align: center;
+}
+
+.loader-title {
+  margin: 0 0 6px;
+  font-weight: 600;
+}
+
+.loader-detail {
+  margin: 0;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
